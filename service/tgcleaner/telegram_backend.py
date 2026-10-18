@@ -2,7 +2,7 @@
 
 Telegram operations used (verified against Telethon 1.45 / API layer 229):
   login     auth.sendCode -> auth.signIn -> (2FA) account.getPassword + auth.checkPassword
-  list      messages.getDialogs via TelegramClient.iter_dialogs (all folders)
+  list      messages.getDialogs, page by page, for the main list (folder 0) and Archive (folder 1)
   activity  date of each dialog's top (most recent) message; absent when there is no history
   read      dialog unread count / read_inbox_max_id; when behind, messages.getHistory(limit=1)
             just below the read position gives the date of the newest message you have read
@@ -50,6 +50,8 @@ OWNER_REASON = ("You own this. Transfer ownership or delete it in the Telegram a
 CONNECT_TIMEOUT = 45  # seconds for one complete connect attempt
 MUTE_FOREVER = datetime.fromtimestamp(2**31 - 1, tz=timezone.utc)  # Telegram's "muted forever"
 SCAN_CACHE = "scan_cache.json"
+DIALOG_PAGE = 100          # dialogs per getDialogs request (Telegram's maximum)
+DIALOG_PAGE_PAUSE = 0.3    # seconds between pages
 
 # Errors that carry a wait time (FLOOD_WAIT_X, FLOOD_PREMIUM_WAIT_X, ...).
 _FLOOD_ERRORS = (errors.FloodWaitError, errors.FloodPremiumWaitError)
@@ -452,42 +454,128 @@ class TelethonBackend:
     async def load_dialogs(self) -> DialogList:
         async with self._lock:
             await self._require_authorized()
-            for attempt in range(2):
-                try:
-                    return await self._fetch_dialogs()
-                except _FLOOD_ERRORS as e:
-                    if attempt == 0 and e.seconds <= 30:
-                        log.info("dialog list rate limited, waiting %s s", e.seconds)
-                        await asyncio.sleep(e.seconds + 1)
-                        continue
-                    raise ServiceError("rate_limited",
-                                       f"Telegram asks to wait {e.seconds} seconds before loading the list again.", 429) from None
-                except (OSError, asyncio.TimeoutError):
-                    raise ServiceError("telegram_unreachable", "Lost the connection to Telegram while loading. Try again.", 503) from None
+            try:
+                return await self._fetch_dialogs()
+            except ServiceError:
+                raise
+            except _FLOOD_ERRORS as e:
+                raise ServiceError("rate_limited",
+                                   f"Telegram asks to wait {e.seconds} seconds before loading the list again.", 429) from None
+            except (OSError, asyncio.TimeoutError):
+                raise ServiceError("telegram_unreachable", "Lost the connection to Telegram while loading. Try again.", 503) from None
+            except Exception as e:
+                log.exception("loading the chat list failed")
+                raise ServiceError("load_failed", f"Couldn't load your chats ({type(e).__name__}: {e}). "
+                                   "The service window has the details.", 500) from None
 
     async def _fetch_dialogs(self) -> DialogList:
         items: list[DialogItem] = []
         entries: dict[str, _Entry] = {}
-        excluded = {"private_chat": 0, "saved_messages": 0}
+        excluded = {"private_chat": 0, "saved_messages": 0, "unreadable": 0}
         cache = self._read_scan_cache()
-        # ignore_migrated hides old basic groups that were upgraded (they are dead copies).
-        async for dialog in self._client.iter_dialogs(ignore_migrated=True):
-            raw = dialog.dialog
-            item = classify(dialog.entity, last_date=dialog.date, archived=dialog.archived,
-                            unread_count=dialog.unread_count, muted=_is_muted(getattr(raw, "notify_settings", None)),
-                            last_is_mine=bool(getattr(dialog.message, "out", False)))
-            if isinstance(item, str):
-                excluded[item] += 1
-                continue
-            if item.id in entries:
-                continue
-            entry = _Entry(item=item, peer=dialog.input_entity, read_max_id=getattr(raw, "read_inbox_max_id", 0) or 0,
-                           is_bot=isinstance(dialog.entity, types.User) and bool(dialog.entity.bot))
-            _apply_cached_scan(entry, cache.get(item.id))
-            items.append(item)
-            entries[item.id] = entry
+        for folder in (0, 1):  # main list, then Archive
+            async for raw, entity, message in self._iter_folder(folder):
+                try:
+                    item = classify(entity, last_date=getattr(message, "date", None), archived=folder == 1,
+                                    unread_count=raw.unread_count,
+                                    muted=_is_muted(getattr(raw, "notify_settings", None)),
+                                    last_is_mine=bool(getattr(message, "out", False)))
+                    if isinstance(item, str):
+                        excluded[item] += 1
+                        continue
+                    if item.id in entries:
+                        continue
+                    try:
+                        peer = utils.get_input_peer(entity)
+                    except TypeError:  # e.g. a "min" channel without access hash: list it, never act on it
+                        peer = None
+                        item.leavable, item.accessible, item.can_post = False, False, False
+                        item.reason = "Telegram did not send enough information to act on this. Reload later."
+                    entry = _Entry(item=item, peer=peer, read_max_id=getattr(raw, "read_inbox_max_id", 0) or 0,
+                                   is_bot=isinstance(entity, types.User) and bool(entity.bot))
+                    _apply_cached_scan(entry, cache.get(item.id))
+                except Exception:
+                    # One odd chat must never break the whole list.
+                    log.exception("skipped a chat that could not be read (%s)", type(entity).__name__)
+                    excluded["unreadable"] += 1
+                    continue
+                items.append(item)
+                entries[item.id] = entry
         self._entries = entries
+        log.info("loaded %d chats (%s)", len(items), ", ".join(f"{k}: {v}" for k, v in excluded.items()))
         return DialogList(items=items, excluded=excluded, loaded_at=datetime.now(timezone.utc))
+
+    async def _iter_folder(self, folder: int):
+        """Yield (raw dialog, entity, top message) for every dialog in one folder, page by page.
+
+        Uses messages.getDialogs directly instead of TelegramClient.iter_dialogs so that a
+        single unusual entry (the Archive folder row, a chat without entity data, a "min"
+        channel) is skipped instead of aborting the whole load.
+        """
+        seen: set[int] = set()
+        offset_date, offset_id, offset_peer = None, 0, types.InputPeerEmpty()
+        for page in range(500):  # hard stop; 500 x 100 dialogs is far beyond any real account
+            request = functions.messages.GetDialogsRequest(
+                offset_date=offset_date, offset_id=offset_id, offset_peer=offset_peer,
+                limit=DIALOG_PAGE, hash=0, exclude_pinned=page > 0, folder_id=folder)
+            result = await self._call_patiently(request)
+            entities = {}
+            for x in list(getattr(result, "users", [])) + list(getattr(result, "chats", [])):
+                try:
+                    entities[utils.get_peer_id(x)] = x
+                except Exception:
+                    pass
+            messages = {}
+            for m in getattr(result, "messages", []):
+                try:
+                    messages[(utils.get_peer_id(m.peer_id), m.id)] = m
+                except Exception:
+                    pass
+            new = 0
+            last_with_message = None
+            for d in getattr(result, "dialogs", []):
+                if not isinstance(d, types.Dialog):  # e.g. dialogFolder: the "Archived chats" row
+                    continue
+                try:
+                    peer_id = utils.get_peer_id(d.peer)
+                except Exception:
+                    continue
+                if peer_id in seen:
+                    continue
+                seen.add(peer_id)
+                new += 1
+                entity = entities.get(peer_id)
+                message = messages.get((peer_id, d.top_message))
+                if message is not None and entity is not None:
+                    last_with_message = (message, entity)
+                if entity is None or isinstance(entity, (types.UserEmpty, types.ChatEmpty)):
+                    continue
+                if getattr(entity, "migrated_to", None) is not None:
+                    continue  # old basic group that was upgraded: a dead copy
+                yield d, entity, message
+            done = (not isinstance(result, types.messages.DialogsSlice)
+                    or len(getattr(result, "dialogs", [])) < DIALOG_PAGE or new == 0 or last_with_message is None)
+            if done:
+                return
+            message, entity = last_with_message
+            try:
+                offset_peer = utils.get_input_peer(entity)
+            except TypeError:
+                return
+            offset_date, offset_id = message.date, message.id
+            await asyncio.sleep(DIALOG_PAGE_PAUSE)
+
+    async def _call_patiently(self, request):
+        """Send a request; wait out short flood waits (up to twice) instead of failing."""
+        for attempt in range(3):
+            try:
+                return await self._client(request)
+            except _FLOOD_ERRORS as e:
+                if attempt == 2 or e.seconds > 60:
+                    raise
+                log.info("Telegram rate limit while loading: waiting %s s", e.seconds)
+                await asyncio.sleep(e.seconds + 1)
+        raise AssertionError("unreachable")
 
     def cached_item(self, item_id: str) -> DialogItem | None:
         entry = self._entries.get(item_id)
@@ -500,8 +588,8 @@ class TelethonBackend:
         if entry is None:
             raise ActionFailed("not_eligible", "Not in the current list. Reload the list.", False)
         reason = ineligibility(entry.item, action)
-        if reason:
-            raise ActionFailed("not_eligible", reason, False)
+        if reason or entry.peer is None:
+            raise ActionFailed("not_eligible", reason or "Telegram did not send enough information to act on this.", False)
         item = entry.item
         try:
             if action == LEAVE and entry.is_bot:

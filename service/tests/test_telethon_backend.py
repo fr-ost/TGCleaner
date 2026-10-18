@@ -140,7 +140,8 @@ class FakeClient:
         self.responses = []  # queued return values for the next requests
         self.fail_on = {}    # request class -> exception raised whenever it is sent
         self.connected = False
-        self.iter_kwargs = None
+        self.dialog_requests = []  # getDialogs calls, kept apart from the action requests under test
+        self.page_flood = []       # exceptions to raise on the next getDialogs calls
         self._phone_code_hash = {}
         self.sign_in_calls = []
         self.sign_in_raises = []
@@ -162,6 +163,8 @@ class FakeClient:
         return types.User(id=42, first_name="Me", username="me", phone="15551234567", is_self=True)
 
     async def __call__(self, request):
+        if isinstance(request, functions.messages.GetDialogsRequest):
+            return self._dialogs_page(request)
         self.requests.append(request)
         if type(request) in self.fail_on:
             raise self.fail_on[type(request)]
@@ -177,10 +180,24 @@ class FakeClient:
             return types.messages.AffectedHistory(pts=1, pts_count=1, offset=0)
         return types.Updates(updates=[], users=[], chats=[], date=NOW, seq=0)
 
-    async def iter_dialogs(self, **kwargs):
-        self.iter_kwargs = kwargs
-        for d in self.dialogs:
-            yield d
+    def _dialogs_page(self, request):
+        """Serve messages.getDialogs from self.dialogs, paginated like Telegram (offset = last message)."""
+        self.dialog_requests.append(request)
+        if self.page_flood:
+            raise self.page_flood.pop(0)
+        rows = [d for d in self.dialogs if d.folder == (request.folder_id or 0)]
+        start = 0
+        if request.offset_id:
+            start = next(i for i, d in enumerate(rows) if d.message and d.message.id == request.offset_id) + 1
+        page = rows[start:start + request.limit]
+        more = start + request.limit < len(rows)
+        users = [d.entity for d in page if isinstance(d.entity, types.User)]
+        chats = [d.entity for d in page if d.entity is not None and not isinstance(d.entity, types.User)]
+        kwargs = dict(dialogs=[d.raw for d in page], messages=[d.message for d in page if d.message],
+                      chats=chats, users=users)
+        if more:
+            return types.messages.DialogsSlice(count=len(rows), **kwargs)
+        return types.messages.Dialogs(**kwargs)
 
     async def sign_in(self, **kwargs):
         self.sign_in_calls.append(kwargs)
@@ -194,10 +211,27 @@ class FakeClient:
         return True
 
 
-def dialog(entity, input_entity, date=NOW, unread=7, read_max=500, out=False, mute_until=None):
-    raw = SimpleNamespace(read_inbox_max_id=read_max, notify_settings=types.PeerNotifySettings(mute_until=mute_until))
-    return SimpleNamespace(entity=entity, input_entity=input_entity, date=date, archived=False, unread_count=unread,
-                           dialog=raw, message=SimpleNamespace(out=out, date=date))
+_msg_ids = iter(range(1000, 10**6))
+
+
+def _peer(entity):
+    if isinstance(entity, (types.Channel, types.ChannelForbidden, types.Community)):
+        return types.PeerChannel(entity.id)
+    if isinstance(entity, (types.Chat, types.ChatForbidden)):
+        return types.PeerChat(entity.id)
+    return types.PeerUser(entity.id)
+
+
+def dialog(entity, date=NOW, unread=7, read_max=500, out=False, mute_until=None, folder=0, with_entity=True):
+    """One row of a getDialogs answer: raw Dialog + entity + its top message."""
+    peer = _peer(entity)
+    message = types.Message(id=next(_msg_ids), peer_id=peer, date=date, message="hi", out=out) if date else None
+    raw = types.Dialog(peer=peer, top_message=message.id if message else 0, read_inbox_max_id=read_max,
+                       read_outbox_max_id=0, unread_count=unread, unread_mentions_count=0,
+                       unread_reactions_count=0, unread_poll_votes_count=0,
+                       notify_settings=types.PeerNotifySettings(mute_until=mute_until),
+                       folder_id=folder or None)
+    return SimpleNamespace(raw=raw, entity=entity if with_entity else None, message=message, folder=folder)
 
 
 def messages(*dates):
@@ -215,13 +249,12 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.dir = Path(self.tmp.name)
         self.cfg = Config(api_id=12345, api_hash="a" * 32)
         self.client = FakeClient(dialogs=[
-            dialog(channel(111, broadcast=True), types.InputPeerChannel(111, 999)),
-            dialog(chat(222), types.InputPeerChat(222), unread=0, out=True),
-            dialog(channel(333, megagroup=True, creator=True), types.InputPeerChannel(333, 1),
-                   mute_until=NOW + timedelta(days=36500)),
-            dialog(user(444), types.InputPeerUser(444, 1)),
-            dialog(user(555, bot=True), types.InputPeerUser(555, 1)),
-            dialog(user(42, is_self=True), types.InputPeerSelf()),
+            dialog(channel(111, broadcast=True)),
+            dialog(chat(222), unread=0, out=True),
+            dialog(channel(333, megagroup=True, creator=True, access_hash=1), mute_until=NOW + timedelta(days=36500)),
+            dialog(user(444)),
+            dialog(user(555, bot=True)),
+            dialog(user(42, is_self=True)),
         ])
         self.backend = TelethonBackend(self.cfg, self.dir, client_factory=lambda: self.client)
         await self.backend.start()
@@ -232,12 +265,79 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
     async def test_load_dialogs_lists_groups_channels_and_bots_only(self):
         result = await self.backend.load_dialogs()
         self.assertEqual([it.id for it in result.items], [CH, GR, OWNED, BOT_ID])
-        self.assertEqual(result.excluded, {"private_chat": 1, "saved_messages": 1})
-        self.assertEqual(self.client.iter_kwargs, {"ignore_migrated": True})
+        self.assertEqual(result.excluded, {"private_chat": 1, "saved_messages": 1, "unreadable": 0})
+        self.assertEqual(sorted(r.folder_id for r in self.client.dialog_requests), [0, 1])  # main list + Archive
         by_id = {it.id: it for it in result.items}
         self.assertTrue(by_id[OWNED].muted)
         self.assertFalse(by_id[CH].muted)
         self.assertEqual(by_id[GR].my_last_message_at, NOW)
+
+    async def test_loader_pages_through_both_folders_and_skips_odd_entries(self):
+        many = [dialog(channel(1000 + i, megagroup=True), date=NOW - timedelta(minutes=i)) for i in range(7)]
+        folder_row = SimpleNamespace(
+            raw=types.DialogFolder(folder=types.Folder(id=1, title="Archived"), peer=types.PeerChannel(1000),
+                                   top_message=0, unread_muted_peers_count=0, unread_unmuted_peers_count=0,
+                                   unread_muted_messages_count=0, unread_unmuted_messages_count=0),
+            entity=None, message=None, folder=0)
+        self.client.dialogs = [folder_row, *many,
+                               dialog(channel(2000, megagroup=True), with_entity=False),       # no entity sent
+                               dialog(chat(2001, migrated_to=types.InputChannel(9, 9))),      # upgraded copy
+                               dialog(channel(2002, min=True, access_hash=None, megagroup=True)),  # min channel
+                               dialog(channel(2003, broadcast=True), folder=1),               # archived
+                               dialog(channel(2004, broadcast=True), date=None, folder=1)]    # no history
+        original = telegram_backend.DIALOG_PAGE
+        telegram_backend.DIALOG_PAGE = 3
+        try:
+            result = await self.backend.load_dialogs()
+        finally:
+            telegram_backend.DIALOG_PAGE = original
+        ids = [it.id for it in result.items]
+        self.assertEqual(len(ids), 10)  # 7 + min channel + 2 archived; folder row, entity-less and migrated skipped
+        self.assertEqual(len(set(ids)), len(ids))
+        self.assertGreater(len(self.client.dialog_requests), 4)  # really paginated
+        by_id = {it.id: it for it in result.items}
+        minc = by_id["-1000000002002"]
+        self.assertFalse(minc.leavable or minc.accessible)
+        self.assertTrue(by_id["-1000000002003"].archived)
+        self.assertFalse(by_id["-1000000001000"].archived)
+        self.assertIsNone(by_id["-1000000002004"].last_message_at)
+        with self.assertRaises(ActionFailed):
+            await self.backend.perform(ARCHIVE, "-1000000002002", {})
+        self.assertEqual(self.client.requests, [])
+
+    async def test_one_unreadable_chat_does_not_break_the_list(self):
+        original = telegram_backend.classify
+
+        def flaky(entity, **kw):
+            if getattr(entity, "id", None) == 222:
+                raise ValueError("weird data")
+            return original(entity, **kw)
+
+        telegram_backend.classify = flaky
+        try:
+            with self.assertLogs("tgcleaner.telegram", "ERROR"):
+                result = await self.backend.load_dialogs()
+        finally:
+            telegram_backend.classify = original
+        self.assertEqual([it.id for it in result.items], [CH, OWNED, BOT_ID])
+        self.assertEqual(result.excluded["unreadable"], 1)
+
+    async def test_short_flood_while_loading_is_waited_out_long_one_reported(self):
+        self.client.page_flood = [errors.FloodWaitError(request=None, capture=1)]
+        result = await self.backend.load_dialogs()
+        self.assertEqual(len(result.items), 4)
+        self.client.page_flood = [errors.FloodWaitError(request=None, capture=600)]
+        with self.assertRaises(ServiceError) as ctx:
+            await self.backend.load_dialogs()
+        self.assertEqual(ctx.exception.status, 429)
+
+    async def test_unexpected_load_error_is_reported_with_its_reason(self):
+        self.client.page_flood = [RuntimeError("boom")]
+        with self.assertLogs("tgcleaner.telegram", "ERROR"):
+            with self.assertRaises(ServiceError) as ctx:
+                await self.backend.load_dialogs()
+        self.assertEqual(ctx.exception.code, "load_failed")
+        self.assertIn("RuntimeError: boom", ctx.exception.message)
 
     async def test_load_requires_login(self):
         self.client.authorized = False
@@ -367,7 +467,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.backend.cached_item(BOT_ID).my_last_message_at, my_date)
         self.assertIsNotNone(self.backend.cached_item(BOT_ID).scanned_at)
         # ... but is dropped once you have read further (the dates could be stale).
-        self.client.dialogs[4] = dialog(user(555, bot=True), types.InputPeerUser(555, 1), read_max=900)
+        self.client.dialogs[4] = dialog(user(555, bot=True), read_max=900)
         await self.backend.load_dialogs()
         self.assertIsNone(self.backend.cached_item(BOT_ID).my_last_message_at)
         self.assertIsNone(self.backend.cached_item(BOT_ID).scanned_at)

@@ -200,7 +200,12 @@
         </div>
         <div id="list" class="list-body"></div>
         <p id="emptyState" class="empty" hidden>Nothing matches these filters.</p>
-        <p id="loadingState" class="empty" hidden>Loading your groups, channels and bots from Telegram…</p>
+        <p id="loadingState" class="empty" hidden>Loading your groups, channels and bots from Telegram… (big accounts can take a minute)</p>
+        <div id="loadError" class="empty load-error" role="alert" hidden>
+          <strong>Couldn't load your chats.</strong>
+          <p id="loadErrorText"></p>
+          <button id="loadRetryBtn" class="btn btn-primary btn-sm">Try again</button>
+        </div>
       </div>
     </section>
   </main>

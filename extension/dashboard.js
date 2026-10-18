@@ -278,10 +278,11 @@ async function loadDialogs({ cached = false } = {}) {
   if (!cached) {
     $("loadingState").hidden = false;
     $("emptyState").hidden = true;
+    $("loadError").hidden = true;
   }
   $("reloadBtn").disabled = true;
   try {
-    const data = await api(cached ? "/api/dialogs?cached=1" : "/api/dialogs");
+    const data = await api(cached ? "/api/dialogs?cached=1" : "/api/dialogs", { timeoutMs: 600_000 });
     state.items = data.items;
     state.byId = new Map(data.items.map((it) => [it.id, it]));
     state.excluded = data.excluded;
@@ -289,9 +290,21 @@ async function loadDialogs({ cached = false } = {}) {
     rows.clear();
     state.selection = pruneSelection(state.selection, state.items, action());
     state.lastClicked = null;
+    $("loadError").hidden = true;
   } catch (e) {
-    toast(errorText(e), 7000);
-    if (e.status === 401) return refreshStatus();
+    if (e.status === 401) {
+      state.loading = false;
+      return refreshStatus();
+    }
+    // Keep the reason on screen (not just a toast) so a failed load is never silent.
+    if (!state.loaded) {
+      $("loadErrorText").textContent = e.code === "service_offline"
+        ? "The local service stopped answering. Check its Terminal window, then try again."
+        : errorText(e);
+      $("loadError").hidden = false;
+    } else {
+      toast(errorText(e), 7000);
+    }
   } finally {
     state.loading = false;
     $("loadingState").hidden = true;
@@ -339,7 +352,9 @@ function renderStats() {
   const ex = state.excluded;
   $("excludedNote").textContent = ex
     ? `${s.bots ? `Includes ${plural(s.bots, "bot")}. ` : ""}Never shown or touched: ${plural(ex.private_chat ?? 0, "private chat")} with people` +
-      `${ex.saved_messages ? " and Saved Messages" : ""}. ${s.unavailable} listed item${s.unavailable === 1 ? "" : "s"} can't be ` +
+      `${ex.saved_messages ? " and Saved Messages" : ""}. ` +
+      `${ex.unreadable ? `${plural(ex.unreadable, "chat")} couldn't be read and ${ex.unreadable === 1 ? "was" : "were"} skipped (details in the service window). ` : ""}` +
+      `${s.unavailable} listed item${s.unavailable === 1 ? "" : "s"} can't be ` +
       `${p.action === "leave" ? "left or removed" : `${p.action}d`} (reason shown on each).`
     : "";
   renderScanBanner(s.needsScan);
@@ -842,6 +857,7 @@ function bind() {
     refreshRows();
   });
   $("reloadBtn").addEventListener("click", () => loadDialogs());
+  $("loadRetryBtn").addEventListener("click", () => loadDialogs());
   $("scanBtn").addEventListener("click", (e) => startScan(null, e.currentTarget));
   $("scanBannerBtn").addEventListener("click", (e) => startScan(null, e.currentTarget));
   $("list").addEventListener("click", onListClick);

@@ -221,6 +221,9 @@ input[type="checkbox"]:disabled { cursor: not-allowed; opacity: .45; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .empty { text-align: center; color: var(--muted); padding: 40px 0; margin: 0; }
+.load-error { color: var(--text); padding: 32px 20px; }
+.load-error strong { color: var(--danger); font-size: 15px; }
+.load-error p { color: var(--muted); max-width: 640px; margin: 8px auto 14px; overflow-wrap: anywhere; }
 
 /* ---------- scan banner ---------- */
 .banner {

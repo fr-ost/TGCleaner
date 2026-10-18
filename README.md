@@ -208,6 +208,7 @@ npm test                                                # or: node --test "tests
 |---|---|
 | Dashboard says **Local service offline** | Start `./start.sh` / `start.bat` and keep the window open. If you changed the port, enter it on that screen. Check `http://127.0.0.1:8765/health` in a browser tab: it should show `{"ok": true, ...}`. |
 | **Service rejected this extension** | The extension ID differs from the configured one, usually because the `key` was removed from `manifest.json`. Run `./start.sh setup` and enter the ID shown on the dashboard (or on `chrome://extensions`), then restart the service. |
+| Connected, but the list stays empty / "Couldn't load your chats" | The dashboard shows the reason; the service window has the full details. Click **Try again**. If Telegram asked to wait, wait that long first. Chats that can't be read are skipped and counted under the stats instead of breaking the list. If it keeps failing, copy the error from the service window. |
 | `Address already in use` on start | Another copy (or demo mode) is running. Close it, or set a different `port` in `config.json` and on the dashboard. |
 | `python3: command not found` / wrong version | Install Python 3.10+; on macOS `brew install python`, on Windows from python.org. You can point the script at a specific interpreter: `PYTHON=/path/to/python3 ./start.sh`. |
 | "Telegram rejected the API ID / hash" | Run `./start.sh setup` again and copy both values exactly from my.telegram.org. |
