@@ -199,11 +199,20 @@ class FakeBackend:
     def set_protected(self, ids: list[str], value: bool) -> list[str]:
         found = []
         for item_id in ids:
+            if value and item_id not in self._entries:
+                continue
             (self._protected.add if value else self._protected.discard)(item_id)
             if item_id in self._entries:
                 self._entries[item_id].protected = value
                 found.append(item_id)
         return found
+
+    def clear_protected(self) -> list[str]:
+        cleared = sorted(self._protected)
+        self._protected.clear()
+        for item in self._entries.values():
+            item.protected = False
+        return cleared
 
     def _remember(self, item_id: str, **values) -> None:
         self._state.setdefault(item_id, {}).update(values)

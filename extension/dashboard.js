@@ -389,6 +389,8 @@ function renderStats() {
     : `No messages ${p.threshold}+ days`;
   $("statUnknown").textContent = state.loaded ? s.unknown : "–";
   $("statSelected").textContent = state.selection.size;
+  $("unprotectAllBtn").hidden = !s.protected;
+  $("unprotectAllBtn").textContent = `Unprotect all (${s.protected})`;
   $("selectInactiveBtn").title = p.basis === "you"
     ? `Select every shown item you haven't read or posted in for ${p.threshold}+ days. Unknown activity is never included.`
     : `Select every shown item whose last message is ${p.threshold}+ days old. Unknown activity is never included.`;
@@ -988,6 +990,18 @@ function bind() {
     const ids = [...state.selection];
     if (!ids.length) return toast("Select the chats to protect first.");
     await withBusy(e.currentTarget, () => setProtected(ids, true));
+  });
+  $("unprotectAllBtn").addEventListener("click", async (e) => {
+    const n = state.items.filter((it) => it.protected).length;
+    if (!window.confirm(`Remove protection from all ${n} protected chats? They can then be selected and left, archived or muted again.`)) return;
+    try {
+      const result = await withBusy(e.currentTarget, () => api("/api/protect", { method: "POST", body: { all: true, protected: false } }));
+      for (const item of state.items) item.protected = false;
+      toast(`Unprotected ${plural(result.ids.length, "chat")}.`);
+      render();
+    } catch (err) {
+      toast(errorText(err), 6000);
+    }
   });
   $("skipFlaggedBtn").addEventListener("click", () => reconfirmWithout(false));
   $("protectFlaggedBtn").addEventListener("click", () => reconfirmWithout(true));

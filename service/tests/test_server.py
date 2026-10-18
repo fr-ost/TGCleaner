@@ -446,6 +446,17 @@ class ProtectTests(ApiTestCase):
         self.assertEqual(last["status"], "failed")
         self.assertIn("Protected", last["message"])
 
+    async def test_unprotect_all(self):
+        _, body, _ = await self.get("/api/dialogs")
+        ids = [it["id"] for it in body["items"]][:5]
+        await self.post("/api/protect", {"ids": ids, "protected": True})
+        status, res, _ = await self.post("/api/protect", {"all": True, "protected": False})
+        self.assertEqual((status, sorted(res["ids"])), (200, sorted(ids)))
+        _, body, _ = await self.get("/api/dialogs")
+        self.assertFalse(any(it["protected"] for it in body["items"]))
+        status, _, _ = await self.post("/api/protect", {"all": True, "protected": True})
+        self.assertEqual(status, 400)  # "protect everything" is not a thing
+
     async def test_validation(self):
         await self.get("/api/dialogs")
         for body in ({"ids": ["-1"]}, {"ids": ["-1"], "protected": "yes"}, {"ids": [], "protected": True}):

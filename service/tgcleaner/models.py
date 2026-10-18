@@ -175,6 +175,10 @@ class Backend(Protocol):
         """Mark/unmark items as protected (persisted). Returns the ids that were found."""
         ...
 
+    def clear_protected(self) -> list[str]:
+        """Remove every protection (the whole saved list). Returns the ids that were protected."""
+        ...
+
     async def scan(self, item_id: str) -> tuple[str, str]:
         """Read-only: look up your read position and your last message for one item."""
         ...

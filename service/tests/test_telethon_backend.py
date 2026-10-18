@@ -374,6 +374,9 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(fresh.cached_item(CH).protected)
         fresh.set_protected([CH], False)
         self.assertEqual((await fresh.perform(LEAVE, CH, {}))[0], "left")
+        fresh.set_protected([GR, OWNED], True)
+        self.assertEqual(fresh.clear_protected(), sorted([GR, OWNED]))
+        self.assertEqual(json.loads((self.dir / "protected.json").read_text()), [])
 
     async def test_folders_failure_never_blocks_the_list(self):
         original = self.client.__class__.__call__

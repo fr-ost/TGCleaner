@@ -538,16 +538,26 @@ class TelethonBackend:
     def set_protected(self, ids: list[str], value: bool) -> list[str]:
         found = []
         for item_id in ids:
+            entry = self._entries.get(item_id)
+            if value and entry is None:
+                continue  # only chats in your list can be protected
             if value:
                 self._protected.add(item_id)
             else:
                 self._protected.discard(item_id)
-            entry = self._entries.get(item_id)
             if entry:
                 entry.item.protected = value
                 found.append(item_id)
         save_protected(self._data_dir, self._protected)
         return found
+
+    def clear_protected(self) -> list[str]:
+        cleared = sorted(self._protected)
+        self._protected.clear()
+        for entry in self._entries.values():
+            entry.item.protected = False
+        save_protected(self._data_dir, self._protected)
+        return cleared
 
     async def _iter_folder(self, folder: int):
         """Yield (raw dialog, entity, top message) for every dialog in one folder, page by page.

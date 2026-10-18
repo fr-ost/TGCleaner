@@ -390,10 +390,15 @@ def _needs_scan(item) -> bool:
 async def protect(request):
     """Mark or unmark chats as protected. Protected chats are refused by every action."""
     body = await _json_body(request)
-    ids = _validate_ids(body.get("ids"))
     value = body.get("protected")
     if not isinstance(value, bool):
         raise ServiceError("bad_request", "'protected' must be true or false.")
+    if body.get("all") is True:
+        # "Unprotect all": clears the whole saved list, including chats not in the current list.
+        if value:
+            raise ServiceError("bad_request", "Protecting everything at once isn't supported; select chats instead.")
+        return web.json_response({"ok": True, "protected": False, "ids": _backend(request).clear_protected()})
+    ids = _validate_ids(body.get("ids"))
     found = _backend(request).set_protected(ids, value)
     return web.json_response({"ok": True, "protected": value, "ids": found})
 
