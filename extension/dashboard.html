@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TG Group Cleaner</title>
+  <link rel="icon" href="icons/icon32.png">
+  <link rel="stylesheet" href="dashboard.css">
+  <script type="module" src="dashboard.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img src="icons/icon48.png" alt="" width="28" height="28">
+      <h1>TG Group Cleaner</h1>
+      <span id="demoBadge" class="badge badge-demo" hidden title="The service runs with fake data and never contacts Telegram">Demo mode</span>
+    </div>
+    <div class="conn">
+      <span id="connDot" class="dot" aria-hidden="true"></span>
+      <span id="connText">Checking the local service…</span>
+      <button id="disconnectBtn" class="btn btn-ghost btn-sm" hidden>Disconnect</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- Local service not reachable -->
+    <section id="offlineView" class="card narrow" hidden>
+      <h2>Start the local service</h2>
+      <p class="muted">The extension talks only to a small service on your computer, which talks to Telegram.</p>
+      <ol class="steps">
+        <li>Open a terminal in the project folder.</li>
+        <li>Run <code>./start.sh</code> (macOS/Linux) or <code>start.bat</code> (Windows).</li>
+        <li>Leave that window open while you use this page.</li>
+      </ol>
+      <p id="offlineDetail" class="form-error" role="alert"></p>
+      <form id="portForm" class="inline-form">
+        <label for="portInput">Service port</label>
+        <input id="portInput" type="number" min="1024" max="65535" inputmode="numeric" required>
+        <button class="btn" type="submit">Save &amp; retry</button>
+      </form>
+    </section>
+
+    <!-- Telegram login -->
+    <section id="loginView" class="card narrow" hidden>
+      <h2>Connect your Telegram account</h2>
+      <p class="muted">Your number, login code and password go only to the local service and on to Telegram. They are never stored or logged.</p>
+
+      <form id="phoneForm" class="stack" hidden>
+        <label for="phoneInput">Phone number (international format)</label>
+        <input id="phoneInput" type="tel" autocomplete="tel" placeholder="+15551234567" required maxlength="32">
+        <button class="btn btn-primary" type="submit">Send login code</button>
+      </form>
+
+      <form id="codeForm" class="stack" hidden>
+        <label for="codeInput">Login code</label>
+        <p id="codeHint" class="muted small"></p>
+        <input id="codeInput" type="text" inputmode="numeric" autocomplete="one-time-code" required maxlength="14">
+        <div class="row">
+          <button class="btn btn-primary" type="submit">Verify code</button>
+          <button class="btn btn-ghost" type="button" data-action="restart-login">Use a different number</button>
+        </div>
+      </form>
+
+      <form id="passwordForm" class="stack" hidden>
+        <label for="passwordInput">Two-step verification password</label>
+        <p id="passwordHint" class="muted small"></p>
+        <input id="passwordInput" type="password" autocomplete="current-password" required maxlength="256">
+        <div class="row">
+          <button class="btn btn-primary" type="submit">Unlock</button>
+          <button class="btn btn-ghost" type="button" data-action="restart-login">Start over</button>
+        </div>
+      </form>
+
+      <p id="loginError" class="form-error" role="alert"></p>
+    </section>
+
+    <!-- Dashboard -->
+    <section id="appView" hidden>
+      <div class="stats">
+        <div class="stat"><span class="stat-label">Groups &amp; channels</span><span id="statTotal" class="stat-value">–</span></div>
+        <div class="stat stat-warn"><span class="stat-label" id="statInactiveLabel">Inactive</span><span id="statInactive" class="stat-value">–</span></div>
+        <div class="stat stat-muted"><span class="stat-label">Unknown activity</span><span id="statUnknown" class="stat-value">–</span></div>
+        <div class="stat stat-accent"><span class="stat-label">Selected</span><span id="statSelected" class="stat-value">0</span></div>
+      </div>
+      <p id="excludedNote" class="muted small"></p>
+
+      <!-- Leave progress -->
+      <section id="progressPanel" class="card progress-card" hidden aria-live="polite">
+        <div class="progress-head">
+          <div>
+            <h2 id="progressTitle">Leaving…</h2>
+            <p id="progressSub" class="muted small"></p>
+          </div>
+          <div class="row">
+            <button id="cancelJobBtn" class="btn btn-sm">Cancel remaining</button>
+            <button id="retryBtn" class="btn btn-sm btn-primary" hidden>Retry failed</button>
+            <button id="dismissJobBtn" class="btn btn-sm btn-ghost" hidden>Close</button>
+          </div>
+        </div>
+        <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
+        <div id="progressCounts" class="chips"></div>
+        <details id="progressDetails">
+          <summary>Results for each item</summary>
+          <label class="check small"><input type="checkbox" id="problemsOnly"> Show only items that need attention</label>
+          <ol id="progressList" class="result-list"></ol>
+        </details>
+      </section>
+
+      <div class="toolbar card">
+        <div class="toolbar-row">
+          <input id="searchInput" class="search" type="search" placeholder="Search by name or @username" aria-label="Search">
+          <label class="field">
+            <span>Inactive for</span>
+            <select id="thresholdSelect">
+              <option value="7">7 days</option>
+              <option value="30">30 days</option>
+              <option value="90">90 days</option>
+              <option value="180">180 days</option>
+              <option value="custom">Custom…</option>
+            </select>
+          </label>
+          <label class="field" id="customField" hidden>
+            <span>Days</span>
+            <input id="customDays" type="number" min="1" max="3650" inputmode="numeric" class="num">
+          </label>
+          <label class="field">
+            <span>Show</span>
+            <select id="showSelect">
+              <option value="all">All</option>
+              <option value="inactive">Inactive</option>
+              <option value="active">Active</option>
+              <option value="unknown">Unknown activity</option>
+              <option value="unavailable">Can't be left</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Type</span>
+            <select id="kindSelect">
+              <option value="all">All types</option>
+              <option value="channel">Channels</option>
+              <option value="supergroup">Supergroups</option>
+              <option value="group">Basic groups</option>
+              <option value="gigagroup">Broadcast groups</option>
+              <option value="other">Other</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Sort</span>
+            <select id="sortSelect">
+              <option value="oldest">Least recently active</option>
+              <option value="recent">Most recently active</option>
+              <option value="name">Name A–Z</option>
+              <option value="name_desc">Name Z–A</option>
+              <option value="kind">Type</option>
+            </select>
+          </label>
+        </div>
+        <div class="toolbar-row">
+          <button id="selectInactiveBtn" class="btn btn-sm">Select inactive</button>
+          <button id="selectAllBtn" class="btn btn-sm">Select all shown</button>
+          <button id="deselectAllBtn" class="btn btn-sm">Deselect all</button>
+          <span class="spacer"></span>
+          <span id="shownCount" class="muted small"></span>
+          <button id="reloadBtn" class="btn btn-sm btn-ghost" title="Load the list again from Telegram">Reload list</button>
+        </div>
+      </div>
+
+      <div class="list card" role="region" aria-label="Groups and channels">
+        <div class="list-head" aria-hidden="true">
+          <span></span><span>Name</span><span>Type</span><span>Role</span><span>Last message</span><span>Status</span>
+        </div>
+        <div id="list" class="list-body"></div>
+        <p id="emptyState" class="empty" hidden>Nothing matches these filters.</p>
+        <p id="loadingState" class="empty" hidden>Loading your groups and channels from Telegram…</p>
+      </div>
+    </section>
+  </main>
+
+  <footer id="actionBar" class="action-bar" hidden>
+    <span id="selectionSummary">Nothing selected</span>
+    <button id="leaveBtn" class="btn btn-danger" disabled>Leave selected</button>
+  </footer>
+
+  <dialog id="confirmDialog" aria-labelledby="confirmTitle">
+    <form method="dialog" class="dialog-body">
+      <h2 id="confirmTitle">Leave?</h2>
+      <p class="muted" id="confirmIntro"></p>
+      <ol id="confirmList" class="confirm-list"></ol>
+      <div id="confirmRejectedWrap" hidden>
+        <h3>Will be skipped</h3>
+        <ul id="confirmRejected" class="confirm-list rejected"></ul>
+      </div>
+      <p class="warn small">Leaving can't be undone here. To rejoin a private group or channel you will need a new invite link.</p>
+      <p id="confirmError" class="form-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button value="cancel" class="btn" id="confirmCancel" autofocus>Cancel</button>
+        <button value="confirm" class="btn btn-danger" id="confirmOk">Leave</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="disconnectDialog" aria-labelledby="disconnectTitle">
+    <form method="dialog" class="dialog-body">
+      <h2 id="disconnectTitle">Disconnect Telegram?</h2>
+      <p class="muted">This logs this tool out of Telegram and deletes the session file from your computer. You can connect again later.</p>
+      <div class="dialog-actions">
+        <button value="cancel" class="btn" autofocus>Cancel</button>
+        <button value="confirm" class="btn btn-danger">Disconnect</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

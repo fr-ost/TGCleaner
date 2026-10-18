@@ -1,0 +1,3 @@
+# Runtime dependencies of the local service (Python 3.10+).
+telethon==1.45.0
+aiohttp==3.14.5

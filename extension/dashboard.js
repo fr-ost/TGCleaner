@@ -1,0 +1,744 @@
+import { ApiError, api, currentPort, loadPort, savePort } from "./api.js";
+import {
+  KIND_LABELS, PRESET_THRESHOLDS, ROLE_LABELS, activityOf, daysSince, formatAgo, formatDate, inactiveIds,
+  matchesFilters, parseThreshold, pruneSelection, retryableIds, selectableIds, sortItems, summarize,
+} from "./logic.js";
+
+const $ = (id) => document.getElementById(id);
+
+const DEFAULT_PREFS = { threshold: 90, thresholdChoice: "90", show: "all", kind: "all", sort: "oldest" };
+
+const state = {
+  status: null,
+  items: [],
+  byId: new Map(),
+  excluded: null,
+  loaded: false,
+  loading: false,
+  selection: new Set(),
+  prefs: { ...DEFAULT_PREFS },
+  query: "",
+  visible: [],
+  lastClicked: null,
+  job: null,
+  jobResults: new Map(),
+  dismissedJob: null,
+  pending: null, // prepared leave awaiting confirmation
+};
+
+const rows = new Map(); // item id -> row element
+let offlineTimer = null;
+let jobTimer = null;
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+function el(tag, props = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (v === undefined || v === null || v === false) continue;
+    if (k === "class") node.className = v;
+    else if (k === "text") node.textContent = v;
+    else if (k === "dataset") Object.assign(node.dataset, v);
+    else if (k in node && typeof v !== "string") node[k] = v;
+    else node.setAttribute(k, v);
+  }
+  for (const c of children) if (c !== null && c !== undefined && c !== false) node.append(c);
+  return node;
+}
+
+let toastTimer = null;
+function toast(message, ms = 4000) {
+  const t = $("toast");
+  t.textContent = message;
+  t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.hidden = true; }, ms);
+}
+
+function errorText(e) {
+  return e instanceof ApiError ? e.message : `Unexpected error: ${e?.message ?? e}`;
+}
+
+async function withBusy(button, fn) {
+  const was = button.disabled;
+  button.disabled = true;
+  try {
+    return await fn();
+  } finally {
+    button.disabled = was;
+  }
+}
+
+function plural(n, one, many = `${one}s`) {
+  return `${n} ${n === 1 ? one : many}`;
+}
+
+const jobActive = () => Boolean(state.job && ["running", "waiting"].includes(state.job.state));
+
+// ---------------------------------------------------------------------------
+// preferences (harmless UI settings only)
+// ---------------------------------------------------------------------------
+
+async function loadPrefs() {
+  try {
+    const { prefs } = await chrome.storage.local.get("prefs");
+    if (prefs && typeof prefs === "object") state.prefs = { ...DEFAULT_PREFS, ...prefs };
+  } catch {
+    // defaults
+  }
+  state.prefs.threshold = parseThreshold(state.prefs.threshold) ?? DEFAULT_PREFS.threshold;
+}
+
+function savePrefs() {
+  chrome.storage.local.set({ prefs: state.prefs }).catch(() => {});
+}
+
+function applyPrefsToControls() {
+  const p = state.prefs;
+  const preset = PRESET_THRESHOLDS.includes(p.threshold) && p.thresholdChoice !== "custom";
+  $("thresholdSelect").value = preset ? String(p.threshold) : "custom";
+  $("customField").hidden = preset;
+  $("customDays").value = p.threshold;
+  $("showSelect").value = p.show;
+  $("kindSelect").value = p.kind;
+  $("sortSelect").value = p.sort;
+}
+
+// ---------------------------------------------------------------------------
+// views & connection status
+// ---------------------------------------------------------------------------
+
+function showView(name) {
+  for (const v of ["offline", "login", "app"]) $(`${v}View`).hidden = v !== name;
+  $("actionBar").hidden = name !== "app";
+}
+
+function setConn(kind, text) {
+  $("connDot").className = `dot ${kind}`;
+  $("connText").textContent = text;
+}
+
+async function refreshStatus() {
+  clearTimeout(offlineTimer);
+  let status;
+  try {
+    status = await api("/api/status");
+  } catch (e) {
+    return showOffline(e);
+  }
+  state.status = status;
+  $("demoBadge").hidden = !status.demo;
+  $("disconnectBtn").hidden = !status.authorized;
+
+  if (!status.telegram_reachable) {
+    // The service is up but not (yet) connected to Telegram: wait and poll instead of offering a login.
+    setConn("warn", status.error?.startsWith("Connecting") ? "Connecting to Telegram…" : "Telegram unreachable");
+    showView("login");
+    showLoginStep(null);
+    $("loginError").textContent = `${status.error ?? "Cannot reach Telegram."} Retrying…`;
+    offlineTimer = setTimeout(refreshStatus, 3000);
+    return;
+  }
+
+  if (!status.authorized) {
+    setConn("warn", "Telegram not connected");
+    showView("login");
+    showLoginStep(status.login_step ?? "phone", { phone: status.login_phone });
+    $("loginError").textContent = "";
+    return;
+  }
+
+  const a = status.account;
+  setConn("ok", a ? `Connected as ${a.name}${a.username ? ` (@${a.username})` : ""}` : "Connected");
+  $("connText").title = a?.phone ? `Phone ${a.phone}` : "";
+  showView("app");
+  await refreshJob();
+  if (!state.loaded) await loadDialogs();
+  else render();
+}
+
+function showOffline(e) {
+  showView("offline");
+  $("demoBadge").hidden = true;
+  $("disconnectBtn").hidden = true;
+  $("portInput").value = currentPort();
+  if (e instanceof ApiError && e.code === "origin_not_allowed") {
+    setConn("bad", "Service rejected this extension");
+    $("offlineDetail").textContent =
+      `The service is running but does not accept this extension's ID (${chrome.runtime.id}). ` +
+      "Run setup again and enter this ID, then restart the service.";
+  } else if (e instanceof ApiError && e.code === "service_offline") {
+    setConn("bad", "Local service offline");
+    $("offlineDetail").textContent = `Nothing is answering on 127.0.0.1:${currentPort()}. Retrying every few seconds…`;
+  } else {
+    setConn("bad", "Local service error");
+    $("offlineDetail").textContent = errorText(e);
+  }
+  offlineTimer = setTimeout(refreshStatus, 3000);
+}
+
+// ---------------------------------------------------------------------------
+// login
+// ---------------------------------------------------------------------------
+
+function showLoginStep(step, info = {}) {
+  $("phoneForm").hidden = step !== "phone";
+  $("codeForm").hidden = step !== "code";
+  $("passwordForm").hidden = step !== "password";
+  if (step === "code") {
+    $("codeHint").textContent = info.delivery
+      ? `Telegram sent a code via ${info.delivery}.`
+      : `Enter the code Telegram sent${info.phone ? ` to ${info.phone}` : ""}.`;
+    $("codeInput").focus();
+  } else if (step === "password") {
+    $("passwordHint").textContent = info.hint ? `Hint: ${info.hint}` : "Your account has two-step verification enabled.";
+    $("passwordInput").focus();
+  } else if (step === "phone") {
+    $("phoneInput").focus();
+  }
+}
+
+async function loginSubmit(event, path, field, input) {
+  event.preventDefault();
+  const button = event.submitter ?? event.target.querySelector("button[type=submit]");
+  $("loginError").textContent = "";
+  const value = input.value;
+  try {
+    const result = await withBusy(button, () => api(path, { method: "POST", body: { [field]: value } }));
+    if (field !== "phone") input.value = "";
+    if (result.step === "done") {
+      $("phoneInput").value = "";
+      toast("Telegram connected.");
+      await refreshStatus();
+    } else {
+      showLoginStep(result.step, result);
+    }
+  } catch (e) {
+    if (field === "password") input.value = "";
+    $("loginError").textContent = errorText(e);
+    if (e.code === "code_expired" || e.code === "no_login") showLoginStep("phone");
+  }
+}
+
+async function restartLogin() {
+  try {
+    await api("/api/login/cancel", { method: "POST", body: {} });
+  } catch {
+    // ignore
+  }
+  $("codeInput").value = "";
+  $("passwordInput").value = "";
+  $("loginError").textContent = "";
+  showLoginStep("phone");
+}
+
+async function disconnect() {
+  try {
+    const result = await api("/api/logout", { method: "POST", body: {} });
+    toast(result.telegram_confirmed
+      ? "Disconnected. The session was ended and deleted."
+      : "Local session deleted. Telegram couldn't confirm; check Settings → Devices in Telegram.", 7000);
+  } catch (e) {
+    toast(errorText(e), 6000);
+    return;
+  }
+  state.items = [];
+  state.byId.clear();
+  rows.clear();
+  state.loaded = false;
+  state.selection.clear();
+  state.job = null;
+  state.jobResults.clear();
+  $("list").replaceChildren();
+  $("progressPanel").hidden = true;
+  await refreshStatus();
+}
+
+// ---------------------------------------------------------------------------
+// dialog list
+// ---------------------------------------------------------------------------
+
+async function loadDialogs() {
+  if (state.loading) return;
+  state.loading = true;
+  $("loadingState").hidden = false;
+  $("emptyState").hidden = true;
+  $("reloadBtn").disabled = true;
+  try {
+    const data = await api("/api/dialogs");
+    state.items = data.items;
+    state.byId = new Map(data.items.map((it) => [it.id, it]));
+    state.excluded = data.excluded;
+    state.loaded = true;
+    rows.clear();
+    state.selection = pruneSelection(state.selection, state.items);
+    state.lastClicked = null;
+  } catch (e) {
+    toast(errorText(e), 7000);
+    if (e.status === 401) return refreshStatus();
+  } finally {
+    state.loading = false;
+    $("loadingState").hidden = true;
+    $("reloadBtn").disabled = jobActive();
+  }
+  render();
+}
+
+function computeVisible() {
+  const now = Date.now();
+  const filters = { query: state.query, show: state.prefs.show, kind: state.prefs.kind, threshold: state.prefs.threshold };
+  state.visible = sortItems(state.items.filter((it) => matchesFilters(it, filters, now)), state.prefs.sort);
+}
+
+function render() {
+  computeVisible();
+  renderStats();
+  renderList();
+  renderActionBar();
+}
+
+function renderStats() {
+  const s = summarize(state.items, state.prefs.threshold, Date.now());
+  $("statTotal").textContent = state.loaded ? s.total : "–";
+  $("statInactive").textContent = state.loaded ? s.inactive : "–";
+  $("statInactiveLabel").textContent = `Inactive ${state.prefs.threshold}+ days`;
+  $("statUnknown").textContent = state.loaded ? s.unknown : "–";
+  $("statSelected").textContent = state.selection.size;
+  $("selectInactiveBtn").textContent = "Select inactive";
+  $("selectInactiveBtn").title =
+    `Select every shown item whose last message is ${state.prefs.threshold}+ days old. Items with unknown activity are never included.`;
+
+  const ex = state.excluded;
+  $("excludedNote").textContent = ex
+    ? `Never shown or touched: ${plural(ex.private_chat ?? 0, "private chat")}, ${plural(ex.bot ?? 0, "bot")}` +
+      `${ex.saved_messages ? " and Saved Messages" : ""}. ${s.unavailable} listed item${s.unavailable === 1 ? "" : "s"} can't be left (reason shown on each).`
+    : "";
+}
+
+function renderList() {
+  const list = $("list");
+  const now = Date.now();
+  const fragment = document.createDocumentFragment();
+  for (const item of state.visible) {
+    let row = rows.get(item.id);
+    if (!row) {
+      row = makeRow(item);
+      rows.set(item.id, row);
+    }
+    updateRow(row, item, now);
+    fragment.append(row);
+  }
+  list.replaceChildren(fragment);
+  $("emptyState").hidden = !state.loaded || state.visible.length > 0;
+  $("shownCount").textContent = state.loaded ? `Showing ${state.visible.length} of ${state.items.length}` : "";
+}
+
+function makeRow(item) {
+  const checkbox = el("input", { type: "checkbox", "aria-label": `Select ${item.title}` });
+  const sub = el("div", { class: "sub" });
+  if (item.link && item.link.startsWith("https://t.me/")) {
+    sub.append(el("a", { href: item.link, target: "_blank", rel: "noopener noreferrer", text: `@${item.username}` }));
+  }
+  if (item.archived) sub.append(el("span", { class: "tag", text: "Archived" }));
+  if (item.participants_count) sub.append(el("span", { text: `${item.participants_count.toLocaleString()} members` }));
+  if (item.unread_count) sub.append(el("span", { text: `${item.unread_count.toLocaleString()} unread` }));
+
+  return el("div", { class: "item", dataset: { id: item.id }, role: "row" },
+    el("div", { class: "cb" }, checkbox),
+    el("div", { class: "title-cell" }, el("div", { class: "title", text: item.title, title: item.title }), sub),
+    el("div", { class: "kind", text: KIND_LABELS[item.kind] ?? item.kind }),
+    el("div", { class: "role", text: ROLE_LABELS[item.role] ?? item.role }),
+    el("div", { class: "when" }, el("span", { class: "ago" }), el("span", { class: "date muted" })),
+    el("div", { class: "status-cell" }),
+  );
+}
+
+const RESULT_LABELS = {
+  pending: ["Queued", "info"],
+  in_progress: ["Leaving…", "info spin"],
+  left: ["Left ✓", "ok"],
+  not_member: ["Not a member", "ok"],
+  failed: ["Failed", "bad"],
+  rate_limited: ["Rate limited", "warn"],
+  cancelled: ["Not attempted", "muted"],
+};
+
+function updateRow(row, item, now) {
+  const selected = state.selection.has(item.id);
+  const disabled = !item.leavable || jobActive();
+  row.classList.toggle("selected", selected);
+  row.classList.toggle("disabled", !item.leavable);
+  const cb = row.querySelector("input");
+  cb.checked = selected;
+  cb.disabled = disabled;
+
+  const activity = activityOf(item, state.prefs.threshold, now);
+  const ago = row.querySelector(".ago");
+  ago.textContent = formatAgo(daysSince(item.last_message_at, now));
+  ago.className = `ago ${activity}`;
+  ago.title = activity === "unknown"
+    ? "Telegram returned no message history, so activity is unknown (not assumed inactive)."
+    : `Last known message: ${new Date(item.last_message_at).toLocaleString()}`;
+  row.querySelector(".date").textContent = item.last_message_at ? formatDate(item.last_message_at) : "No history available";
+
+  const cell = row.querySelector(".status-cell");
+  const result = state.jobResults.get(item.id);
+  if (result) {
+    const [label, cls] = RESULT_LABELS[result.status] ?? [result.status, "muted"];
+    cell.replaceChildren(el("span", { class: `pill ${cls}`, text: label, title: result.message ?? "" }));
+    if (result.message && !["left", "pending", "in_progress"].includes(result.status)) {
+      cell.append(el("div", { class: "reason", text: result.message, title: result.message }));
+    }
+  } else if (!item.leavable) {
+    cell.replaceChildren(
+      el("span", { class: "pill muted", text: "Can't leave here" }),
+      el("div", { class: "reason", text: item.reason ?? "", title: item.reason ?? "" }),
+    );
+  } else {
+    cell.replaceChildren();
+  }
+}
+
+function refreshRows() {
+  const now = Date.now();
+  for (const item of state.visible) {
+    const row = rows.get(item.id);
+    if (row) updateRow(row, item, now);
+  }
+  renderStats();
+  renderActionBar();
+}
+
+function renderActionBar() {
+  const n = state.selection.size;
+  const visibleSelected = state.visible.filter((it) => state.selection.has(it.id)).length;
+  const hidden = n - visibleSelected;
+  $("selectionSummary").textContent = n === 0
+    ? "Nothing selected"
+    : `${plural(n, "item")} selected${hidden > 0 ? ` (${hidden} hidden by filters)` : ""}`;
+  $("leaveBtn").disabled = n === 0 || jobActive();
+  $("leaveBtn").textContent = n ? `Leave selected (${n})` : "Leave selected";
+  const lock = jobActive();
+  for (const id of ["selectInactiveBtn", "selectAllBtn", "deselectAllBtn", "reloadBtn"]) $(id).disabled = lock;
+}
+
+function setSelected(ids, value) {
+  for (const id of ids) {
+    if (value) state.selection.add(id);
+    else state.selection.delete(id);
+  }
+  refreshRows();
+}
+
+function onListClick(event) {
+  if (event.target.closest("a")) return;
+  const row = event.target.closest(".item");
+  if (!row || jobActive()) return;
+  const item = state.byId.get(row.dataset.id);
+  if (!item || !item.leavable) return;
+  const index = state.visible.indexOf(item);
+  const value = !state.selection.has(item.id);
+  if (event.shiftKey && state.lastClicked !== null) {
+    // Shift+click selects/deselects the whole range in the current view.
+    const from = Math.min(state.lastClicked, index);
+    const to = Math.max(state.lastClicked, index);
+    setSelected(selectableIds(state.visible.slice(from, to + 1)), value);
+  } else {
+    setSelected([item.id], value);
+  }
+  state.lastClicked = index;
+  if (event.target.matches("input[type=checkbox]")) event.target.checked = state.selection.has(item.id);
+}
+
+// ---------------------------------------------------------------------------
+// leave: prepare -> confirm -> start
+// ---------------------------------------------------------------------------
+
+async function prepareAndConfirm(ids, button) {
+  let prepared;
+  try {
+    prepared = await withBusy(button, () => api("/api/leave/prepare", { method: "POST", body: { ids } }));
+  } catch (e) {
+    toast(errorText(e), 7000);
+    return;
+  }
+  state.pending = prepared;
+  const n = prepared.items.length;
+  $("confirmTitle").textContent = n ? `Leave ${plural(n, "group or channel", "groups and channels")}?` : "Nothing to leave";
+  $("confirmIntro").textContent = n
+    ? "You will leave exactly these, one at a time. Nothing has been left yet."
+    : "None of the selected items can be left.";
+  $("confirmList").replaceChildren(...prepared.items.map((it) =>
+    el("li", {}, el("span", { text: it.title }), el("span", { class: "k", text: KIND_LABELS[it.kind] ?? it.kind }))));
+  $("confirmList").hidden = n === 0;
+  $("confirmRejectedWrap").hidden = prepared.rejected.length === 0;
+  $("confirmRejected").replaceChildren(...prepared.rejected.map((r) =>
+    el("li", {}, el("strong", { text: r.title ?? r.id }), el("span", { class: "k", text: ` — ${r.reason ?? "not leavable"}` }))));
+  $("confirmOk").hidden = n === 0;
+  $("confirmOk").disabled = false;
+  $("confirmOk").textContent = `Leave ${n}`;
+  $("confirmError").textContent = "";
+  $("confirmDialog").showModal();
+}
+
+async function confirmLeave(event) {
+  event.preventDefault();
+  const pending = state.pending;
+  if (!pending?.token) return;
+  const button = $("confirmOk");
+  button.disabled = true; // a second click can't start anything: the token is single-use anyway
+  try {
+    const job = await api("/api/leave/start", { method: "POST", body: { token: pending.token } });
+    state.pending = null;
+    $("confirmDialog").close("started");
+    for (const it of pending.items) state.selection.delete(it.id);
+    setJob(job);
+    pollJob();
+  } catch (e) {
+    $("confirmError").textContent = errorText(e);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// job progress
+// ---------------------------------------------------------------------------
+
+async function refreshJob() {
+  try {
+    const { job } = await api("/api/leave/job");
+    if (job) setJob(job);
+    if (jobActive()) pollJob();
+  } catch {
+    // shown elsewhere
+  }
+}
+
+function setJob(job) {
+  const wasActive = jobActive();
+  state.job = job;
+  state.jobResults = new Map(job.items.map((it) => [it.id, it]));
+  if (!jobActive()) {
+    // Telegram-confirmed results make items unleavable locally, so they can't be selected again.
+    for (const r of job.items) {
+      const item = state.byId.get(r.id);
+      if (item && (r.status === "left" || r.status === "not_member")) {
+        item.leavable = false;
+        item.reason = r.status === "left" ? "You left this." : "You already left this.";
+      }
+    }
+    state.selection = pruneSelection(state.selection, state.items);
+  }
+  renderProgress();
+  if (state.loaded) {
+    refreshRows();
+    if (wasActive && !jobActive()) render();
+  }
+}
+
+function pollJob() {
+  clearTimeout(jobTimer);
+  jobTimer = setTimeout(async () => {
+    try {
+      const { job } = await api("/api/leave/job");
+      if (job) setJob(job);
+    } catch (e) {
+      $("progressSub").textContent = `${errorText(e)} Still trying…`;
+    }
+    if (jobActive() || !state.job) pollJob();
+    else onJobFinished();
+  }, 1000);
+}
+
+function onJobFinished() {
+  const c = state.job.counts;
+  toast(`Finished: ${c.left ?? 0} left, ${c.failed ?? 0} failed.`, 6000);
+}
+
+function countChip(count, label, cls) {
+  return count ? el("span", { class: `pill ${cls}`, text: `${label}: ${count}` }) : null;
+}
+
+let lastProgressKey = "";
+
+function renderProgress() {
+  const job = state.job;
+  const panel = $("progressPanel");
+  if (!job || state.dismissedJob === job.id) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  const c = job.counts;
+  const active = jobActive();
+  const problems = (c.failed ?? 0) + (c.rate_limited ?? 0) + (c.cancelled ?? 0);
+  panel.classList.toggle("done", !active && problems === 0);
+  panel.classList.toggle("problem", !active && problems > 0);
+
+  let title;
+  let sub = "";
+  if (job.state === "running") {
+    title = `Leaving… ${job.processed} of ${job.total}`;
+    sub = job.cancel_requested
+      ? "Cancelling: stopping after the current item."
+      : "Items are left one at a time with a short pause between them. You can close this tab; the service keeps going.";
+  } else if (job.state === "waiting") {
+    const secs = Math.max(0, Math.ceil(job.wait_until - Date.now() / 1000));
+    title = `Paused by Telegram rate limit (${job.processed} of ${job.total} done)`;
+    sub = `Telegram asked us to wait. Resuming automatically in ${secs} s.`;
+  } else if (job.state === "stopped_rate_limited") {
+    title = `Stopped: Telegram rate limit (${job.processed - (c.rate_limited ?? 0)} of ${job.total} processed)`;
+    const at = job.retry_after ? new Date(job.retry_after * 1000).toLocaleTimeString() : "later";
+    sub = `Telegram asked for a long pause, so the rest were not attempted. You can retry them after ${at}.`;
+  } else if (job.state === "cancelled") {
+    title = "Cancelled";
+    sub = "Items not yet attempted were left untouched.";
+  } else {
+    title = problems ? "Finished with some problems" : "Finished";
+    sub = "Every status below is Telegram's actual answer. Use Reload list to refresh the list from Telegram.";
+  }
+  $("progressTitle").textContent = title;
+  $("progressSub").textContent = sub;
+  $("progressBar").style.width = `${job.total ? (100 * job.processed) / job.total : 0}%`;
+  $("progressCounts").replaceChildren(...[
+    countChip(c.left, "Left", "ok"),
+    countChip(c.not_member, "Already not a member", "ok"),
+    countChip(c.failed, "Failed", "bad"),
+    countChip(c.rate_limited, "Rate limited", "warn"),
+    countChip(c.cancelled, "Not attempted", "muted"),
+    countChip((c.pending ?? 0) + (c.in_progress ?? 0), "Remaining", "info"),
+  ].filter(Boolean));
+
+  $("cancelJobBtn").hidden = !active;
+  $("cancelJobBtn").disabled = job.cancel_requested;
+  const retry = retryableIds(job);
+  $("retryBtn").hidden = active || retry.length === 0;
+  $("retryBtn").textContent = `Retry ${retry.length} eligible`;
+  $("dismissJobBtn").hidden = active;
+
+  const key = `${job.id}:${job.processed}:${job.state}:${$("problemsOnly").checked}`;
+  if (key !== lastProgressKey) {
+    lastProgressKey = key;
+    const problemsOnly = $("problemsOnly").checked;
+    const shown = job.items.filter((it) => !problemsOnly || ["failed", "rate_limited", "cancelled"].includes(it.status));
+    $("progressList").replaceChildren(...shown.map((it) => {
+      const [label, cls] = RESULT_LABELS[it.status] ?? [it.status, "muted"];
+      return el("li", {},
+        el("span", { class: `pill ${cls}`, text: label }), " ",
+        el("span", { text: it.title }),
+        it.message && it.status !== "left" ? el("span", { class: "msg", text: it.message }) : null);
+    }));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// wiring
+// ---------------------------------------------------------------------------
+
+function debounce(fn, ms) {
+  let t;
+  return (...args) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...args), ms);
+  };
+}
+
+function bind() {
+  $("portForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      await savePort($("portInput").value);
+      await refreshStatus();
+    } catch (err) {
+      $("offlineDetail").textContent = err.message;
+    }
+  });
+
+  $("phoneForm").addEventListener("submit", (e) => loginSubmit(e, "/api/login/phone", "phone", $("phoneInput")));
+  $("codeForm").addEventListener("submit", (e) => loginSubmit(e, "/api/login/code", "code", $("codeInput")));
+  $("passwordForm").addEventListener("submit", (e) => loginSubmit(e, "/api/login/password", "password", $("passwordInput")));
+  for (const b of document.querySelectorAll("[data-action=restart-login]")) b.addEventListener("click", restartLogin);
+
+  $("disconnectBtn").addEventListener("click", () => $("disconnectDialog").showModal());
+  $("disconnectDialog").addEventListener("close", () => {
+    if ($("disconnectDialog").returnValue === "confirm") disconnect();
+  });
+
+  $("searchInput").addEventListener("input", debounce((e) => {
+    state.query = e.target.value;
+    render();
+  }, 120));
+  $("thresholdSelect").addEventListener("change", (e) => {
+    const v = e.target.value;
+    state.prefs.thresholdChoice = v;
+    $("customField").hidden = v !== "custom";
+    if (v === "custom") {
+      $("customDays").focus();
+    } else {
+      state.prefs.threshold = Number(v);
+      $("customDays").value = v;
+    }
+    savePrefs();
+    render();
+  });
+  $("customDays").addEventListener("input", debounce((e) => {
+    const n = parseThreshold(e.target.value);
+    if (n === null) return;
+    state.prefs.threshold = n;
+    savePrefs();
+    render();
+  }, 250));
+  for (const [id, key] of [["showSelect", "show"], ["kindSelect", "kind"], ["sortSelect", "sort"]]) {
+    $(id).addEventListener("change", (e) => {
+      state.prefs[key] = e.target.value;
+      savePrefs();
+      render();
+    });
+  }
+
+  $("selectInactiveBtn").addEventListener("click", () => {
+    const ids = inactiveIds(state.visible, state.prefs.threshold, Date.now());
+    setSelected(ids, true);
+    toast(ids.length ? `Selected ${plural(ids.length, "inactive item")}.` : "No leavable inactive items in this view.");
+  });
+  $("selectAllBtn").addEventListener("click", () => setSelected(selectableIds(state.visible), true));
+  $("deselectAllBtn").addEventListener("click", () => {
+    state.selection.clear();
+    refreshRows();
+  });
+  $("reloadBtn").addEventListener("click", loadDialogs);
+  $("list").addEventListener("click", onListClick);
+
+  $("leaveBtn").addEventListener("click", (e) => prepareAndConfirm([...state.selection], e.currentTarget));
+  $("confirmOk").addEventListener("click", confirmLeave);
+  $("confirmDialog").addEventListener("close", () => {
+    if ($("confirmDialog").returnValue !== "started") state.pending = null;
+  });
+
+  $("cancelJobBtn").addEventListener("click", async (e) => {
+    try {
+      const job = await withBusy(e.currentTarget, () => api("/api/leave/cancel", { method: "POST", body: {} }));
+      setJob(job);
+    } catch (err) {
+      toast(errorText(err));
+    }
+  });
+  $("retryBtn").addEventListener("click", (e) => prepareAndConfirm(retryableIds(state.job), e.currentTarget));
+  $("dismissJobBtn").addEventListener("click", () => {
+    state.dismissedJob = state.job?.id ?? null;
+    state.jobResults.clear();
+    renderProgress();
+    if (state.loaded) render();
+  });
+  $("problemsOnly").addEventListener("change", renderProgress);
+}
+
+async function init() {
+  bind();
+  await Promise.all([loadPrefs(), loadPort()]);
+  applyPrefsToControls();
+  await refreshStatus();
+}
+
+init();

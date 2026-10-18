@@ -1,0 +1,9 @@
+{
+  "name": "tg-group-cleaner",
+  "private": true,
+  "description": "Personal Telegram group cleaner. No npm dependencies; this file only configures the JS unit tests.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test \"tests/extension/*.test.mjs\""
+  }
+}

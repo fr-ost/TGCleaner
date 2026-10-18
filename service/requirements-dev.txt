@@ -1,0 +1,2 @@
+# Tests use only the standard library's unittest (pytest also works if you prefer it).
+-r requirements.txt
