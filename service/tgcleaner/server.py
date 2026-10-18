@@ -1,6 +1,6 @@
 """Local JSON API for the Chrome extension.
 
-Security model:
+Security model (local, the default):
   * Listens on 127.0.0.1 only.
   * Host header must be 127.0.0.1:<port> or localhost:<port> (blocks DNS rebinding).
   * Every /api request must come from the extension's own origin
@@ -13,16 +13,23 @@ Security model:
     that token. The read-only engagement scan needs no token. Only one job (of any
     kind) runs at a time, which also keeps the request rate low.
   * Request bodies are never logged (they may contain login codes or passwords).
+
+Cloud mode (serve --cloud, e.g. on Railway) is reachable from the internet, where
+Origin can be forged by any non-browser client. There, every /api request must also
+carry "Authorization: Bearer <TGC_ACCESS_TOKEN>" (constant-time compared; repeated
+failures lock the API for a minute), and the Host check is replaced by that token.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import re
 import secrets
 import time
+from collections import deque
 from dataclasses import dataclass
 
 from aiohttp import web
@@ -77,13 +84,24 @@ def _cors_headers(origin: str) -> dict:
     }
 
 
-def make_security_middleware(cfg: Config):
+AUTH_FAILURE_LIMIT = 20     # wrong tokens allowed per window ...
+AUTH_FAILURE_WINDOW = 60.0  # ... seconds, before the API locks for a window
+
+
+def make_security_middleware(cfg: Config, access_token: str | None = None):
     allowed_hosts = {f"127.0.0.1:{cfg.port}", f"localhost:{cfg.port}"}
     allowed_origins = cfg.allowed_origins
+    expected = f"Bearer {access_token}".encode() if access_token else None
+    failures: deque[float] = deque()
+
+    def locked(now: float) -> bool:
+        while failures and failures[0] < now - AUTH_FAILURE_WINDOW:
+            failures.popleft()
+        return len(failures) >= AUTH_FAILURE_LIMIT
 
     @web.middleware
     async def security(request: web.Request, handler):
-        if request.host not in allowed_hosts:
+        if expected is None and request.host not in allowed_hosts:
             return _error(403, "bad_host", "Requests must address 127.0.0.1 directly.")
         if request.path == "/health":
             # Lets the start script / you check the service is up. Reveals nothing.
@@ -99,7 +117,7 @@ def make_security_middleware(cfg: Config):
                 return _error(405, "method_not_allowed", "Method not allowed.")
             headers = _cors_headers(origin) | {
                 "Access-Control-Allow-Methods": "GET, POST",
-                "Access-Control-Allow-Headers": "Content-Type, X-TGCleaner",
+                "Access-Control-Allow-Headers": "Content-Type, X-TGCleaner, Authorization",
                 "Access-Control-Max-Age": "600",
             }
             if request.headers.get("Access-Control-Request-Private-Network") == "true":
@@ -107,6 +125,16 @@ def make_security_middleware(cfg: Config):
             return web.Response(status=204, headers=headers)
         if request.headers.get("X-TGCleaner") != "1":
             return _error(403, "missing_header", "Missing X-TGCleaner header.")
+        if expected is not None:
+            now = time.monotonic()
+            if locked(now):
+                return _cors(_error(429, "auth_locked", "Too many wrong access tokens. Try again in a minute."), origin)
+            given = request.headers.get("Authorization", "").encode()
+            if not hmac.compare_digest(given, expected):
+                failures.append(now)
+                log.warning("rejected request with a missing or wrong access token")
+                return _cors(_error(401, "bad_access_token",
+                                    "The access token is missing or wrong. Set it in the extension's connection settings."), origin)
         if request.method == "POST" and request.content_type != "application/json":
             return _error(415, "json_required", "Send JSON.")
         try:
@@ -118,10 +146,14 @@ def make_security_middleware(cfg: Config):
         except Exception:
             log.exception("unhandled error on %s", request.path)
             response = _error(500, "internal_error", "Unexpected error. See the service window for details.")
-        response.headers.update(_cors_headers(origin))
-        return response
+        return _cors(response, origin)
 
     return security
+
+
+def _cors(response: web.Response, origin: str) -> web.Response:
+    response.headers.update(_cors_headers(origin))
+    return response
 
 
 async def _json_body(request: web.Request) -> dict:
@@ -355,8 +387,9 @@ async def job_cancel(request):
     return web.json_response(job.to_json())
 
 
-def create_app(cfg: Config, backend: Backend, *, demo: bool = False) -> web.Application:
-    app = web.Application(middlewares=[make_security_middleware(cfg)], client_max_size=MAX_BODY)
+def create_app(cfg: Config, backend: Backend, *, demo: bool = False,
+               access_token: str | None = None) -> web.Application:
+    app = web.Application(middlewares=[make_security_middleware(cfg, access_token)], client_max_size=MAX_BODY)
     app[BACKEND] = backend
     app[STATE] = State(cfg, demo)
     app.router.add_get("/health", lambda r: web.json_response({"ok": True}))
@@ -391,9 +424,14 @@ def create_app(cfg: Config, backend: Backend, *, demo: bool = False) -> web.Appl
     return app
 
 
-def run(cfg: Config, backend: Backend, *, demo: bool = False) -> None:
-    app = create_app(cfg, backend, demo=demo)
-    print(f"TG Cleaner service on http://127.0.0.1:{cfg.port}"
-          f"{'  [DEMO MODE: no Telegram connection]' if demo else ''}")
+def run(cfg: Config, backend: Backend, *, demo: bool = False, access_token: str | None = None) -> None:
+    app = create_app(cfg, backend, demo=demo, access_token=access_token)
+    demo_note = "  [DEMO MODE: no Telegram connection]" if demo else ""
+    if access_token:
+        # Cloud mode: reachable from outside (behind the platform's HTTPS proxy), token required.
+        print(f"TG Cleaner service (cloud mode) listening on 0.0.0.0:{cfg.port}{demo_note}", flush=True)
+        web.run_app(app, host="0.0.0.0", port=cfg.port, access_log=None, print=None)
+        return
+    print(f"TG Cleaner service on http://127.0.0.1:{cfg.port}{demo_note}")
     print("Keep this window open while you use the extension. Press Ctrl+C to stop.")
     web.run_app(app, host="127.0.0.1", port=cfg.port, access_log=None, print=None)

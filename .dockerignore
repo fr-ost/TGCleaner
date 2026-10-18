@@ -1,0 +1,12 @@
+.git
+**/.venv
+**/__pycache__
+**/*.pyc
+**/*.session
+**/*.session-journal
+extension
+docs
+tests
+service/tests
+node_modules
+*.zip

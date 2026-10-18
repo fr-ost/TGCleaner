@@ -386,5 +386,101 @@ class CleanupActionTests(ApiTestCase):
         self.assertEqual(job["state"], "cancelled")
 
 
+TOKEN = "t" * 40
+
+
+class CloudModeTests(unittest.IsolatedAsyncioTestCase):
+    """Hosted mode: reachable from the internet, so an access token is required on every API call."""
+
+    async def asyncSetUp(self):
+        self.port = free_port()
+        self.cfg = Config(api_id=1, api_hash="0" * 32, port=self.port)
+        items, truth = demo_items(20, seed=5)
+        self.backend = FakeBackend(items, truth, authorized=True)
+        self.server = TestServer(create_app(self.cfg, self.backend, access_token=TOKEN), host="127.0.0.1", port=self.port)
+        await self.server.start_server()
+        self.http = ClientSession()
+        self.url = f"http://127.0.0.1:{self.port}"
+        # Requests arrive through the platform's proxy with the public host name.
+        self.public = {"Host": "tgcleaner-production.up.railway.app"}
+
+    async def asyncTearDown(self):
+        await self.http.close()
+        await self.server.close()
+
+    async def get(self, path, headers):
+        async with self.http.get(self.url + path, headers=headers) as r:
+            return r.status, (await r.json()), r.headers
+
+    async def test_health_is_open_for_the_platform_healthcheck(self):
+        status, body, _ = await self.get("/health", {"Host": "healthcheck.railway.app"})
+        self.assertEqual((status, body["ok"]), (200, True))
+
+    async def test_token_required_even_with_a_valid_looking_origin(self):
+        forged = HEADERS | self.public  # curl can send any Origin; the token is what protects the account
+        for auth in (None, "Bearer wrong", f"Bearer {TOKEN}x", TOKEN, f"bearer {TOKEN}"):
+            headers = forged | ({"Authorization": auth} if auth else {})
+            status, body, resp_headers = await self.get("/api/status", headers)
+            self.assertEqual((status, body["error"]), (401, "bad_access_token"), auth)
+            self.assertEqual(resp_headers["Access-Control-Allow-Origin"], ORIGIN)  # extension can read the reason
+        status, body, _ = await self.get("/api/dialogs", forged | {"Authorization": f"Bearer {TOKEN}"})
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["items"]), 20)
+
+    async def test_origin_still_checked_in_cloud_mode(self):
+        status, body, _ = await self.get("/api/status", {"Origin": "https://evil.example", "X-TGCleaner": "1",
+                                                         "Authorization": f"Bearer {TOKEN}"} | self.public)
+        self.assertEqual((status, body["error"]), (403, "origin_not_allowed"))
+
+    async def test_preflight_allows_authorization_header(self):
+        async with self.http.options(self.url + "/api/status", headers={
+                "Origin": ORIGIN, "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "authorization,x-tgcleaner"} | self.public) as r:
+            self.assertEqual(r.status, 204)
+            self.assertIn("Authorization", r.headers["Access-Control-Allow-Headers"])
+
+    async def test_repeated_wrong_tokens_lock_the_api(self):
+        bad = HEADERS | self.public | {"Authorization": "Bearer nope"}
+        for _ in range(20):
+            await self.get("/api/status", bad)
+        status, body, _ = await self.get("/api/status", HEADERS | self.public | {"Authorization": f"Bearer {TOKEN}"})
+        self.assertEqual((status, body["error"]), (429, "auth_locked"))
+
+    async def test_local_mode_still_rejects_foreign_hosts(self):
+        local = TestServer(create_app(self.cfg, self.backend), host="127.0.0.1", port=free_port())
+        await local.start_server()
+        try:
+            async with self.http.get(f"http://127.0.0.1:{local.port}/api/status", headers=HEADERS | self.public) as r:
+                self.assertEqual(r.status, 403)
+        finally:
+            await local.close()
+
+
+class CloudSettingsTests(unittest.TestCase):
+    def test_reads_environment(self):
+        from tgcleaner.config import cloud_settings_from_env
+
+        s = cloud_settings_from_env({"TG_API_ID": "12345", "TG_API_HASH": "a" * 32, "TGC_ACCESS_TOKEN": TOKEN,
+                                     "PORT": "8080", "TGC_LEAVE_DELAY": "3"})
+        self.assertEqual((s.config.api_id, s.config.port, s.access_token, s.demo), (12345, 8080, TOKEN, False))
+        self.assertEqual(s.config.leave_delay_seconds, 3.0)
+        self.assertEqual(s.config.extension_ids, [DEFAULT_EXTENSION_ID])
+
+    def test_demo_needs_no_telegram_credentials(self):
+        from tgcleaner.config import cloud_settings_from_env
+
+        s = cloud_settings_from_env({"TGC_ACCESS_TOKEN": TOKEN, "TGC_DEMO": "1"})
+        self.assertTrue(s.demo)
+
+    def test_rejects_missing_or_weak_settings(self):
+        from tgcleaner.config import cloud_settings_from_env
+
+        for env in ({}, {"TGC_ACCESS_TOKEN": "short", "TG_API_ID": "1", "TG_API_HASH": "a" * 32},
+                    {"TGC_ACCESS_TOKEN": TOKEN}, {"TGC_ACCESS_TOKEN": TOKEN, "TG_API_ID": "1", "TG_API_HASH": "nothex"},
+                    {"TGC_ACCESS_TOKEN": TOKEN, "TG_API_ID": "1", "TG_API_HASH": "a" * 32, "TGC_EXTENSION_IDS": "bad"}):
+            with self.assertRaises(ValueError, msg=env):
+                cloud_settings_from_env(env)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -106,6 +106,35 @@ Demo mode uses 320 fake groups and channels plus 24 bots, and never contacts Tel
 
 ---
 
+## Deploy on Railway (optional)
+
+You can run the service on [Railway](https://railway.com) instead of your computer, so the dashboard works without keeping a terminal open.
+
+> **Read this first.** On Railway, your logged-in Telegram session lives on a server on the internet. Anyone with that session file, or your access token, can control your Telegram account. The deployment is protected by a long secret **access token** on every request (plus HTTPS and the extension-origin check). Keep the token private, use a long random one, and click **Disconnect** (or delete the volume) when you no longer need the deployment.
+
+1. **Create the service**: in Railway, *New Project → Deploy from GitHub repo* → pick this repository. Railway finds the `Dockerfile` and `railway.json` (health check on `/health`, one replica).
+2. **Add a volume**: in the service, open *Settings → Volumes* (or right-click → *Attach volume*) and set the **mount path to `/data`**. Without it you'd have to log in again after every deploy.
+3. **Set variables** (*Variables* tab):
+
+   | Variable | Value |
+   |---|---|
+   | `TG_API_ID` | your API ID from my.telegram.org |
+   | `TG_API_HASH` | your API hash |
+   | `TGC_ACCESS_TOKEN` | a long random secret. Generate one with `python3 -c "import secrets; print(secrets.token_urlsafe(32))"` |
+
+   Optional: `TGC_DEMO=1` runs fake data with no Telegram (good for a first test; still needs `TGC_ACCESS_TOKEN`); `TGC_LEAVE_DELAY` / `TGC_SCAN_DELAY` change the pauses; `TGC_EXTENSION_IDS` if you changed the extension's key.
+4. **Expose it**: *Settings → Networking → Generate Domain*. You get `https://<something>.up.railway.app`.
+5. **Connect the extension**: open the dashboard, click **Connection** (top right), enter the `https://…up.railway.app` address and your access token, then **Save & connect**. Log in to Telegram as usual.
+
+Notes:
+* Keep **one replica**: the running job and login steps live in the service's memory.
+* Logs are in Railway's *Deployments → Logs* (what the "service window" refers to elsewhere in this README). Codes, passwords and tokens are never logged.
+* Telegram will report a new login from Railway's server location; that's this deployment.
+* To go back to running it locally, set the address to `http://127.0.0.1:8765` with an empty token.
+* The service starts in cloud mode with `python -m tgcleaner serve --cloud`. Any Docker host works the same way: run the image with the variables above, a volume at `/data`, and HTTPS in front of it.
+
+---
+
 ## Using the dashboard
 
 ### Finding what to clean
@@ -155,6 +184,8 @@ Click **Disconnect** in the header. This calls Telegram's logout (ending the ses
 ---
 
 ## Security
+
+These points describe the default local mode. In cloud mode (Railway), the service listens on the platform's network, the Host check is replaced by the required access token (constant-time compared, `Authorization: Bearer …`, the API locks for a minute after 20 wrong tokens), and the extension refuses plain `http://` for anything but this computer, so the token only travels over HTTPS.
 
 * The service listens on **127.0.0.1** only, never on your network.
 * Every `/api` request must:
@@ -208,6 +239,9 @@ npm test                                                # or: node --test "tests
 |---|---|
 | Dashboard says **Local service offline** | Start `./start.sh` / `start.bat` and keep the window open. If you changed the port, enter it on that screen. Check `http://127.0.0.1:8765/health` in a browser tab: it should show `{"ok": true, ...}`. |
 | **Service rejected this extension** | The extension ID differs from the configured one, usually because the `key` was removed from `manifest.json`. Run `./start.sh setup` and enter the ID shown on the dashboard (or on `chrome://extensions`), then restart the service. |
+| **Access token missing or wrong** (hosted) | Click **Connection** and paste exactly the `TGC_ACCESS_TOKEN` value from Railway's *Variables*. After 20 wrong attempts the API locks for a minute. |
+| Railway deploy fails / keeps restarting | Check *Deployments → Logs*. `Cannot start: …` names the missing variable. |
+| Logged out after every Railway deploy | Add a volume mounted at `/data` (step 2 of the Railway section). |
 | Connected, but the list stays empty / "Couldn't load your chats" | The dashboard shows the reason; the service window has the full details. Click **Try again**. If Telegram asked to wait, wait that long first. Chats that can't be read are skipped and counted under the stats instead of breaking the list. If it keeps failing, copy the error from the service window. |
 | `Address already in use` on start | Another copy (or demo mode) is running. Close it, or set a different `port` in `config.json` and on the dashboard. |
 | `python3: command not found` / wrong version | Install Python 3.10+; on macOS `brew install python`, on Windows from python.org. You can point the script at a specific interpreter: `PYTHON=/path/to/python3 ./start.sh`. |
@@ -240,7 +274,8 @@ service/
     server.py         aiohttp API + security checks
     fake_backend.py   demo mode / tests (no Telegram)
   tests/
-start.sh / start.bat  create venv, install, set up, run
+start.sh / start.bat  create venv, install, set up, run (local)
+Dockerfile, railway.json  hosted deployment (cloud mode)
 tests/extension/      JS unit tests
 ```
 

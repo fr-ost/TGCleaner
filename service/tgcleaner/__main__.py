@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import getpass
 import logging
+import os
 import shutil
 import sys
 
@@ -52,6 +53,11 @@ def cmd_setup(args) -> int:
 def cmd_serve(args) -> int:
     from .server import run
 
+    if os.name == "posix":
+        os.umask(0o077)  # everything the service writes (session, scan cache) is readable by its owner only
+
+    if args.cloud:
+        return serve_cloud()
     base = data_dir()
     cfg = load_config(base)
     if args.demo:
@@ -74,6 +80,31 @@ def cmd_serve(args) -> int:
 
     ensure_private_dir(base)
     run(cfg, TelethonBackend(cfg, base))
+    return 0
+
+
+def serve_cloud() -> int:
+    """Hosted mode (Railway etc.): settings from environment variables, access token required."""
+    from .config import cloud_settings_from_env
+    from .server import run
+
+    try:
+        settings = cloud_settings_from_env()
+    except ValueError as e:
+        print(f"Cannot start: {e}", file=sys.stderr, flush=True)
+        return 2
+    base = ensure_private_dir(data_dir())
+    if settings.demo:
+        from .fake_backend import FakeBackend
+
+        backend = FakeBackend(random_failures=True)
+    else:
+        from .telegram_backend import TelethonBackend
+
+        backend = TelethonBackend(settings.config, base)
+    print(f"Data directory: {base} (mount a persistent volume here, or you'll have to log in after every deploy)",
+          flush=True)
+    run(settings.config, backend, demo=settings.demo, access_token=settings.access_token)
     return 0
 
 
@@ -129,6 +160,8 @@ def main(argv=None) -> int:
     serve = sub.add_parser("serve", help="run the local service for the extension")
     serve.add_argument("--demo", action="store_true", help="fake data, no Telegram connection")
     serve.add_argument("--port", type=int, help=f"port (default {DEFAULT_PORT})")
+    serve.add_argument("--cloud", action="store_true",
+                       help="hosted mode (e.g. Railway): config from environment variables, access token required")
     sub.add_parser("logout", help="log out of Telegram and delete the local session")
     sub.add_parser("reset", help="delete all local data")
     args = parser.parse_args(argv)

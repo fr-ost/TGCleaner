@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "TG Cleaner (personal)",
   "short_name": "TG Cleaner",
-  "version": "1.1.0",
-  "description": "Find inactive Telegram groups, channels and bots, or chats you ignore, then leave, archive or mute them. Talks only to your local service on 127.0.0.1.",
+  "version": "1.2.0",
+  "description": "Find inactive Telegram groups, channels and bots, or chats you ignore, then leave, archive or mute them. Talks only to your own TG Cleaner service (local or self-hosted).",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqy/DgXOj7fUipKJiu+YBvItonnLiEahtSgx+Mi3H9gKs3AkDbdQX0V6cKW5b8dZtITZiIsfec8HAiQL6vZKlYzLaJsDxhrg5C01HalCDIKyGO/d4+GuHp/gfG0hyftwgOpvNDyxIb0o/s7encuDpieP8OYIXQrjgJ+bhqWgsoVougvybQzdsMzYfTAwdXoSHcozhft2oEJKcyGzo5BtNUyTBaLe3NjElIR3DmExOfVsoVk+vQcOB0CC3IZsYeup4KkfofSsQ68M1uQARDqJgmV3I1nzjWGswg0M3eV5hKTiHRAwEv1rMfGd2/OLt3BKRIsyWi06vX6qa0DjP51pEhQIDAQAB",
   "action": {
     "default_title": "Open TG Cleaner",
@@ -27,6 +27,6 @@
     "storage"
   ],
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; connect-src http://127.0.0.1:*"
+    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; connect-src http://127.0.0.1:* http://localhost:* https:"
   }
 }

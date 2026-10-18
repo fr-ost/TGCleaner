@@ -18,6 +18,7 @@
     <div class="conn">
       <span id="connDot" class="dot" aria-hidden="true"></span>
       <span id="connText">Checking the local service…</span>
+      <button id="settingsBtn" class="btn btn-ghost btn-sm" title="Service address and access token">Connection</button>
       <button id="disconnectBtn" class="btn btn-ghost btn-sm" hidden>Disconnect</button>
     </div>
   </header>
@@ -25,18 +26,19 @@
   <main>
     <!-- Local service not reachable -->
     <section id="offlineView" class="card narrow" hidden>
-      <h2>Start the local service</h2>
-      <p class="muted">The extension talks only to a small service on your computer, which talks to Telegram.</p>
+      <h2>Connect to the TG Cleaner service</h2>
+      <p class="muted">The extension talks to the TG Cleaner service, which talks to Telegram. Run it on this computer, or use your hosted copy (e.g. on Railway).</p>
       <ol class="steps">
-        <li>Open a terminal in the project folder.</li>
-        <li>Run <code>./start.sh</code> (macOS/Linux) or <code>start.bat</code> (Windows).</li>
-        <li>Leave that window open while you use this page.</li>
+        <li><strong>On this computer:</strong> run <code>./start.sh</code> (macOS/Linux) or <code>start.bat</code> (Windows) in the project folder and keep that window open. Address: <code>http://127.0.0.1:8765</code>, no token.</li>
+        <li><strong>Hosted:</strong> enter your service's <code>https://</code> address and the <code>TGC_ACCESS_TOKEN</code> you set there.</li>
       </ol>
       <p id="offlineDetail" class="form-error" role="alert"></p>
-      <form id="portForm" class="inline-form">
-        <label for="portInput">Service port</label>
-        <input id="portInput" type="number" min="1024" max="65535" inputmode="numeric" required>
-        <button class="btn" type="submit">Save &amp; retry</button>
+      <form id="connForm" class="stack">
+        <label for="urlInput">Service address</label>
+        <input id="urlInput" type="url" required placeholder="http://127.0.0.1:8765" autocomplete="off" spellcheck="false">
+        <label for="tokenInput">Access token <span class="muted small">(hosted service only)</span></label>
+        <input id="tokenInput" type="password" autocomplete="off" spellcheck="false" placeholder="Leave empty for this computer">
+        <button class="btn btn-primary" type="submit">Save &amp; connect</button>
       </form>
     </section>
 

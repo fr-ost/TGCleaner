@@ -89,8 +89,8 @@ class Config:
         self.api_id = validate_api_id(self.api_id)
         self.api_hash = validate_api_hash(self.api_hash)
         self.port = int(self.port)
-        if not 1024 <= self.port <= 65535:
-            raise ValueError("port must be between 1024 and 65535")
+        if not 1 <= self.port <= 65535:
+            raise ValueError("port must be between 1 and 65535")
         self.extension_ids = [validate_extension_id(x) for x in self.extension_ids]
         self.leave_delay_seconds = max(0.5, float(self.leave_delay_seconds))
         self.scan_delay_seconds = max(0.3, float(self.scan_delay_seconds))
@@ -133,3 +133,45 @@ def save_config(cfg: Config, base: Path | None = None) -> Path:
         raise
     make_private(path)
     return path
+
+
+MIN_TOKEN_LENGTH = 24
+
+
+@dataclass
+class CloudSettings:
+    config: Config
+    access_token: str
+    demo: bool
+
+
+def cloud_settings_from_env(env=None) -> CloudSettings:
+    """Settings for a hosted deployment (e.g. Railway), read from environment variables.
+
+    TG_API_ID, TG_API_HASH  your app credentials from my.telegram.org (not needed with TGC_DEMO=1)
+    TGC_ACCESS_TOKEN        required: long random secret; the extension must send it
+    PORT                    port to listen on (set by Railway)
+    TGC_EXTENSION_IDS       optional, comma-separated extension IDs (default: the pinned one)
+    TGC_DEMO=1              fake data, no Telegram (to test a deployment)
+    """
+    env = os.environ if env is None else env
+    token = (env.get("TGC_ACCESS_TOKEN") or "").strip()
+    if len(token) < MIN_TOKEN_LENGTH:
+        raise ValueError(
+            f"TGC_ACCESS_TOKEN must be set to a random secret of at least {MIN_TOKEN_LENGTH} characters. "
+            "Generate one with: python3 -c \"import secrets; print(secrets.token_urlsafe(32))\"")
+    demo = env.get("TGC_DEMO", "").strip().lower() in ("1", "true", "yes")
+    ext_ids = [x for x in (env.get("TGC_EXTENSION_IDS") or "").replace(" ", "").split(",") if x] or [DEFAULT_EXTENSION_ID]
+    port = int(env.get("PORT") or 8080)
+    if demo:
+        cfg = Config(api_id=1, api_hash="0" * 32, port=port, extension_ids=ext_ids,
+                     leave_delay_seconds=0.5, scan_delay_seconds=0.3, max_auto_flood_wait=60)
+    else:
+        missing = [k for k in ("TG_API_ID", "TG_API_HASH") if not env.get(k)]
+        if missing:
+            raise ValueError(f"Missing environment variable(s): {', '.join(missing)} (from my.telegram.org).")
+        cfg = Config(api_id=env["TG_API_ID"], api_hash=env["TG_API_HASH"], port=port, extension_ids=ext_ids)
+        for key, attr in (("TGC_LEAVE_DELAY", "leave_delay_seconds"), ("TGC_SCAN_DELAY", "scan_delay_seconds")):
+            if env.get(key):
+                setattr(cfg, attr, max(0.3, float(env[key])))
+    return CloudSettings(config=cfg, access_token=token, demo=demo)

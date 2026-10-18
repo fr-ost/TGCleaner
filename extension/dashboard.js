@@ -1,4 +1,4 @@
-import { ApiError, api, currentPort, loadPort, savePort } from "./api.js";
+import { ApiError, api, currentSettings, isLocal, loadSettings, saveSettings } from "./api.js";
 import {
   ACTIONS, KIND_LABELS, PRESET_THRESHOLDS, ROLE_LABELS, activityOf, daysSince, eligible, engagementIso,
   estimateSeconds, formatAgo, formatDate, formatDuration, inactiveIds, ineligibility, matchesFilters, needsScan,
@@ -171,21 +171,41 @@ async function refreshStatus() {
 }
 
 function showOffline(e) {
+  const { serviceUrl, accessToken } = currentSettings();
+  if ($("offlineView").hidden) {
+    // Fill the fields only when the screen opens, so the automatic retries never overwrite your typing.
+    $("urlInput").value = serviceUrl;
+    $("tokenInput").value = accessToken;
+  }
   showView("offline");
   $("demoBadge").hidden = true;
   $("disconnectBtn").hidden = true;
-  $("portInput").value = currentPort();
-  if (e instanceof ApiError && e.code === "origin_not_allowed") {
+  if (e instanceof ApiError && e.code === "bad_access_token") {
+    setConn("bad", "Access token missing or wrong");
+    $("offlineDetail").textContent = `${serviceUrl} rejected the access token. Enter the TGC_ACCESS_TOKEN you set for the service.`;
+    $("tokenInput").focus();
+    return; // no automatic retry: it would only count as more wrong attempts
+  } else if (e instanceof ApiError && e.code === "auth_locked") {
+    setConn("bad", "Too many wrong tokens");
+    $("offlineDetail").textContent = errorText(e);
+  } else if (e instanceof ApiError && e.code === "origin_not_allowed") {
     setConn("bad", "Service rejected this extension");
     $("offlineDetail").textContent =
       `The service is running but does not accept this extension's ID (${chrome.runtime.id}). ` +
-      "Run setup again and enter this ID, then restart the service.";
+      (isLocal(serviceUrl)
+        ? "Run setup again and enter this ID, then restart the service."
+        : "Add this ID to the service's TGC_EXTENSION_IDS variable and redeploy.");
   } else if (e instanceof ApiError && e.code === "service_offline") {
-    setConn("bad", "Local service offline");
-    $("offlineDetail").textContent = `Nothing is answering on 127.0.0.1:${currentPort()}. Retrying every few seconds…`;
-  } else {
-    setConn("bad", "Local service error");
+    setConn("bad", "Service offline");
+    $("offlineDetail").textContent = isLocal(serviceUrl)
+      ? `Nothing is answering on ${serviceUrl}. Start the service; retrying every few seconds…`
+      : `${serviceUrl} is not answering. Check the deployment (logs, domain); retrying every few seconds…`;
+  } else if (e) {
+    setConn("bad", "Service error");
     $("offlineDetail").textContent = errorText(e);
+  } else {
+    setConn("warn", "Connection settings");
+    return;
   }
   offlineTimer = setTimeout(refreshStatus, 3000);
 }
@@ -245,6 +265,20 @@ async function restartLogin() {
   showLoginStep("phone");
 }
 
+/** Forget everything loaded from the current service (used when switching services). */
+function resetSession() {
+  state.items = [];
+  state.byId.clear();
+  rows.clear();
+  state.loaded = false;
+  state.selection.clear();
+  state.job = null;
+  state.jobResults.clear();
+  clearTimeout(jobTimer);
+  $("list").replaceChildren();
+  $("progressPanel").hidden = true;
+}
+
 async function disconnect() {
   try {
     const result = await api("/api/logout", { method: "POST", body: {} });
@@ -255,15 +289,7 @@ async function disconnect() {
     toast(errorText(e), 6000);
     return;
   }
-  state.items = [];
-  state.byId.clear();
-  rows.clear();
-  state.loaded = false;
-  state.selection.clear();
-  state.job = null;
-  state.jobResults.clear();
-  $("list").replaceChildren();
-  $("progressPanel").hidden = true;
+  resetSession();
   await refreshStatus();
 }
 
@@ -781,14 +807,22 @@ function setPref(key, value) {
 }
 
 function bind() {
-  $("portForm").addEventListener("submit", async (e) => {
+  $("connForm").addEventListener("submit", async (e) => {
     e.preventDefault();
     try {
-      await savePort($("portInput").value);
-      await refreshStatus();
+      await saveSettings($("urlInput").value, $("tokenInput").value);
     } catch (err) {
       $("offlineDetail").textContent = err.message;
+      return;
     }
+    resetSession();
+    await refreshStatus();
+  });
+  $("settingsBtn").addEventListener("click", () => {
+    clearTimeout(offlineTimer);
+    showOffline(null);
+    $("offlineDetail").textContent = "";
+    clearTimeout(offlineTimer);
   });
 
   $("phoneForm").addEventListener("submit", (e) => loginSubmit(e, "/api/login/phone", "phone", $("phoneInput")));
@@ -892,7 +926,7 @@ function bind() {
 
 async function init() {
   bind();
-  await Promise.all([loadPrefs(), loadPort()]);
+  await Promise.all([loadPrefs(), loadSettings()]);
   applyPrefsToControls();
   await refreshStatus();
 }

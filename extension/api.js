@@ -1,6 +1,7 @@
-// Client for the local service. Holds no secrets: the service keeps the Telegram session.
+// Client for the TG Cleaner service: local (http://127.0.0.1:8765, the default) or hosted (https://…, e.g. Railway).
+// The service keeps the Telegram session. For a hosted service the extension stores its access token.
 
-export const DEFAULT_PORT = 8765;
+export const DEFAULT_URL = "http://127.0.0.1:8765";
 
 export class ApiError extends Error {
   constructor(status, code, message) {
@@ -10,38 +11,63 @@ export class ApiError extends Error {
   }
 }
 
-let port = DEFAULT_PORT;
+let baseUrl = DEFAULT_URL;
+let accessToken = "";
 
-export async function loadPort() {
+/**
+ * Accepts a local address (http://127.0.0.1:PORT or http://localhost:PORT) or an https:// address.
+ * Plain http to anything else is refused so the access token never travels unencrypted.
+ * Returns the normalized origin, or throws with a readable message.
+ */
+export function normalizeServiceUrl(value) {
+  let url;
   try {
-    const { port: saved } = await chrome.storage.local.get("port");
-    const n = Number(saved);
-    if (Number.isInteger(n) && n >= 1024 && n <= 65535) port = n;
+    url = new URL(String(value).trim());
   } catch {
-    // keep the default
+    throw new Error("Enter the service address, e.g. http://127.0.0.1:8765 or https://your-app.up.railway.app");
   }
-  return port;
+  const local = url.hostname === "127.0.0.1" || url.hostname === "localhost";
+  if (url.protocol === "http:" && !local) throw new Error("A hosted service must use https://");
+  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("The address must start with http:// or https://");
+  return url.origin;
 }
 
-export async function savePort(value) {
-  const n = Number(value);
-  if (!Number.isInteger(n) || n < 1024 || n > 65535) throw new Error("Port must be a number between 1024 and 65535.");
-  port = n;
-  await chrome.storage.local.set({ port: n });
+export const isLocal = (url = baseUrl) => /^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(url);
+
+export async function loadSettings() {
+  try {
+    const { serviceUrl, accessToken: token, port } = await chrome.storage.local.get(["serviceUrl", "accessToken", "port"]);
+    if (serviceUrl) baseUrl = normalizeServiceUrl(serviceUrl);
+    else if (Number.isInteger(Number(port)) && port) baseUrl = `http://127.0.0.1:${Number(port)}`; // older versions stored only a port
+    accessToken = typeof token === "string" ? token : "";
+  } catch {
+    // keep the defaults
+  }
+  return { serviceUrl: baseUrl, accessToken };
 }
 
-export function currentPort() {
-  return port;
+export async function saveSettings(serviceUrl, token) {
+  const url = normalizeServiceUrl(serviceUrl);
+  const cleaned = String(token ?? "").trim();
+  if (!isLocal(url) && !cleaned) throw new Error("A hosted service needs its access token (TGC_ACCESS_TOKEN).");
+  baseUrl = url;
+  accessToken = cleaned;
+  await chrome.storage.local.set({ serviceUrl: url, accessToken: cleaned });
+}
+
+export function currentSettings() {
+  return { serviceUrl: baseUrl, accessToken };
 }
 
 export async function api(path, { method = "GET", body, timeoutMs = 120_000 } = {}) {
   const headers = { "X-TGCleaner": "1" };
   if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   let res;
   try {
-    res = await fetch(`http://127.0.0.1:${port}${path}`, {
+    res = await fetch(`${baseUrl}${path}`, {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -50,7 +76,7 @@ export async function api(path, { method = "GET", body, timeoutMs = 120_000 } = 
       signal: controller.signal,
     });
   } catch (e) {
-    throw new ApiError(0, "service_offline", "The local service is not running (or not on this port).");
+    throw new ApiError(0, "service_offline", `The service at ${baseUrl} is not answering.`);
   } finally {
     clearTimeout(timer);
   }
