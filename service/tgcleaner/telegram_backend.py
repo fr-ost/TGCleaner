@@ -4,19 +4,29 @@ Telegram operations used (verified against Telethon 1.45 / API layer 229):
   login     auth.sendCode -> auth.signIn -> (2FA) account.getPassword + auth.checkPassword
   list      messages.getDialogs via TelegramClient.iter_dialogs (all folders)
   activity  date of each dialog's top (most recent) message; absent when there is no history
+  read      dialog unread count / read_inbox_max_id; when behind, messages.getHistory(limit=1)
+            just below the read position gives the date of the newest message you have read
+  posted    messages.search(from_id=inputPeerSelf, limit=1): your newest message in the chat
   leave     channels.leaveChannel for channels/supergroups,
             messages.deleteChatUser(chat_id, inputUserSelf) for basic groups
+  bots      messages.deleteHistory(revoke=False) deletes the chat on your side only;
+            contacts.block optionally blocks the bot
+  archive   folders.editPeerFolders(folder_id=1)
+  mute      account.updateNotifySettings(mute_until=forever)
   logout    auth.logOut, then the local session file is deleted
 
 We deliberately do not use TelegramClient.delete_dialog(): given a user it would
-delete a private conversation. Leaving here can only ever target a channel or a
-basic group that was listed, classified as leavable and confirmed.
+delete a private conversation. Human private chats and Saved Messages are never
+listed, so no action can reach them; deleting a chat is only done for bots.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,8 +35,8 @@ from telethon import TelegramClient, errors, functions, types, utils
 from . import __version__
 from .config import Config, make_private, session_path
 from .models import (
-    BROADCAST_GROUP, CHANNEL, GROUP, OTHER, SUPERGROUP,
-    DialogItem, DialogList, LeaveFailed, NotMember, RateLimited, ServiceError,
+    ARCHIVE, BOT, BROADCAST_GROUP, CHANNEL, GROUP, LEAVE, MUTE, OTHER, SUPERGROUP,
+    ActionFailed, DialogItem, DialogList, RateLimited, ServiceError, ineligibility, iso, parse_iso,
 )
 
 log = logging.getLogger("tgcleaner.telegram")
@@ -38,6 +48,8 @@ OWNER_REASON = ("You own this. Transfer ownership or delete it in the Telegram a
                 "this tool does not leave chats you created.")
 
 CONNECT_TIMEOUT = 45  # seconds for one complete connect attempt
+MUTE_FOREVER = datetime.fromtimestamp(2**31 - 1, tz=timezone.utc)  # Telegram's "muted forever"
+SCAN_CACHE = "scan_cache.json"
 
 # Errors that carry a wait time (FLOOD_WAIT_X, FLOOD_PREMIUM_WAIT_X, ...).
 _FLOOD_ERRORS = (errors.FloodWaitError, errors.FloodPremiumWaitError)
@@ -47,22 +59,31 @@ _FLOOD_ERRORS = (errors.FloodWaitError, errors.FloodPremiumWaitError)
 # Classification (pure: unit tested with real Telethon types, no network)
 # ---------------------------------------------------------------------------
 
-def classify(entity, *, last_date, archived: bool, unread_count: int):
+def classify(entity, *, last_date, archived: bool, unread_count: int,
+             muted: bool = False, last_is_mine: bool = False):
     """Turn one dialog's entity into a DialogItem.
 
-    Returns a string category ("private_chat", "bot", "saved_messages") for
-    dialogs that must never be listed.
+    Returns a string category ("private_chat", "saved_messages") for dialogs
+    that must never be listed.
     """
-    if isinstance(entity, types.User):
-        if entity.is_self:
-            return "saved_messages"
-        return "bot" if entity.bot else "private_chat"
+    if isinstance(entity, types.User) and (entity.is_self or not entity.bot):
+        return "saved_messages" if entity.is_self else "private_chat"
 
     peer_id = str(utils.get_peer_id(entity))
-    title = getattr(entity, "title", None) or "(untitled)"
     last = _valid_date(last_date)
-    common = dict(id=peer_id, title=title, last_message_at=last, archived=archived,
-                  unread_count=unread_count or 0)
+    common = dict(
+        id=peer_id, last_message_at=last, archived=archived, unread_count=unread_count or 0, muted=muted,
+        # Free engagement signals from the dialog list itself:
+        last_read_at=last if (unread_count or 0) == 0 else None,   # caught up: you've read the newest message
+        my_last_message_at=last if last_is_mine else None,         # the newest message is yours
+    )
+
+    if isinstance(entity, types.User):  # a bot
+        name = utils.get_display_name(entity) or "(deleted bot)"
+        return DialogItem(title=name, kind=BOT, username=_username(entity), role="none",
+                          participants_count=None, leavable=True, can_post=True, **common)
+
+    title = getattr(entity, "title", None) or "(untitled)"
 
     if isinstance(entity, types.Channel):
         if entity.megagroup:
@@ -79,14 +100,17 @@ def classify(entity, *, last_date, archived: bool, unread_count: int):
             reason = OWNER_REASON
         elif entity.min or entity.access_hash is None:
             reason = "Telegram did not provide enough information to leave this safely. Reload and try again."
-        return DialogItem(kind=kind, username=_username(entity), role=role,
+        rights = entity.admin_rights
+        can_post = kind != CHANNEL or bool(entity.creator or (rights and rights.post_messages))
+        return DialogItem(title=title, kind=kind, username=_username(entity), role=role,
                           participants_count=entity.participants_count,
-                          leavable=reason is None, reason=reason, **common)
+                          leavable=reason is None, reason=reason, can_post=can_post, **common)
 
     if isinstance(entity, types.ChannelForbidden):
         kind = SUPERGROUP if entity.megagroup else CHANNEL
-        return DialogItem(kind=kind, username=None, role="none", participants_count=None,
-                          leavable=False, reason="You were banned or this is no longer accessible.", **common)
+        return DialogItem(title=title, kind=kind, username=None, role="none", participants_count=None,
+                          leavable=False, reason="You were banned or this is no longer accessible.",
+                          accessible=False, can_post=False, **common)
 
     if isinstance(entity, types.Chat):
         reason = None
@@ -96,19 +120,25 @@ def classify(entity, *, last_date, archived: bool, unread_count: int):
             reason = "You already left this group."
         elif entity.creator:
             reason = OWNER_REASON
-        return DialogItem(kind=GROUP, username=None, role=_role(entity, broadcast=False),
+        return DialogItem(title=title, kind=GROUP, username=None, role=_role(entity, broadcast=False),
                           participants_count=entity.participants_count,
-                          leavable=reason is None, reason=reason, **common)
+                          leavable=reason is None, reason=reason, can_post=reason is None or entity.creator, **common)
 
     if isinstance(entity, types.ChatForbidden):
-        return DialogItem(kind=GROUP, username=None, role="none", participants_count=None,
-                          leavable=False, reason="You were removed from this group.", **common)
+        return DialogItem(title=title, kind=GROUP, username=None, role="none", participants_count=None,
+                          leavable=False, reason="You were removed from this group.",
+                          accessible=False, can_post=False, **common)
 
     # Communities and any entity type added by a future Telegram layer.
-    return DialogItem(kind=OTHER, username=None, role="unknown", participants_count=None,
-                      leavable=False,
+    return DialogItem(title=title, kind=OTHER, username=None, role="unknown", participants_count=None,
+                      leavable=False, can_post=False,
                       reason=f"{type(entity).__name__} is not supported by this tool. Use the Telegram app.",
                       **common)
+
+
+def _is_muted(notify_settings) -> bool:
+    until = getattr(notify_settings, "mute_until", None)
+    return isinstance(until, datetime) and until > datetime.now(timezone.utc)
 
 
 def _valid_date(value):
@@ -170,6 +200,14 @@ def _code_delivery(sent) -> str:
     }.get(kind, "Telegram")
 
 
+@dataclass
+class _Entry:
+    item: DialogItem
+    peer: object          # InputPeer* used for every request
+    read_max_id: int      # read_inbox_max_id when the list was loaded
+    is_bot: bool
+
+
 # ---------------------------------------------------------------------------
 # Backend
 # ---------------------------------------------------------------------------
@@ -188,7 +226,7 @@ class TelethonBackend:
         self._login: dict | None = None  # {"phone", "hash", "step"} while logging in
         self._me = None
         self._connect_error: str | None = None
-        self._entries: dict[str, tuple[DialogItem, object]] = {}
+        self._entries: dict[str, _Entry] = {}
 
     def _make_client(self) -> TelegramClient:
         return TelegramClient(
@@ -199,7 +237,7 @@ class TelethonBackend:
             raise_last_call_error=True,
             connection_retries=2,
             receive_updates=False,
-            device_model="TG Group Cleaner (personal)",
+            device_model="TG Cleaner (personal)",
             app_version=__version__,
         )
 
@@ -403,6 +441,7 @@ class TelethonBackend:
                 self._me = None
                 self._login = None
                 self._entries.clear()
+                (self._data_dir / SCAN_CACHE).unlink(missing_ok=True)
                 self._client = self._client_factory()
                 self._kick_connect()
             log.info("logged out (telegram confirmed: %s)", remote_ok)
@@ -428,55 +467,188 @@ class TelethonBackend:
 
     async def _fetch_dialogs(self) -> DialogList:
         items: list[DialogItem] = []
-        entries: dict[str, tuple[DialogItem, object]] = {}
-        excluded = {"private_chat": 0, "bot": 0, "saved_messages": 0}
+        entries: dict[str, _Entry] = {}
+        excluded = {"private_chat": 0, "saved_messages": 0}
+        cache = self._read_scan_cache()
         # ignore_migrated hides old basic groups that were upgraded (they are dead copies).
         async for dialog in self._client.iter_dialogs(ignore_migrated=True):
+            raw = dialog.dialog
             item = classify(dialog.entity, last_date=dialog.date, archived=dialog.archived,
-                            unread_count=dialog.unread_count)
+                            unread_count=dialog.unread_count, muted=_is_muted(getattr(raw, "notify_settings", None)),
+                            last_is_mine=bool(getattr(dialog.message, "out", False)))
             if isinstance(item, str):
                 excluded[item] += 1
                 continue
             if item.id in entries:
                 continue
+            entry = _Entry(item=item, peer=dialog.input_entity, read_max_id=getattr(raw, "read_inbox_max_id", 0) or 0,
+                           is_bot=isinstance(dialog.entity, types.User) and bool(dialog.entity.bot))
+            _apply_cached_scan(entry, cache.get(item.id))
             items.append(item)
-            entries[item.id] = (item, dialog.input_entity)
+            entries[item.id] = entry
         self._entries = entries
         return DialogList(items=items, excluded=excluded, loaded_at=datetime.now(timezone.utc))
 
     def cached_item(self, item_id: str) -> DialogItem | None:
         entry = self._entries.get(item_id)
-        return entry[0] if entry else None
+        return entry.item if entry else None
 
-    def mark_left(self, item_id: str, note: str) -> None:
+    # -- actions -------------------------------------------------------------
+
+    async def perform(self, action: str, item_id: str, options: dict) -> tuple[str, str]:
         entry = self._entries.get(item_id)
-        if entry:
-            entry[0].leavable = False
-            entry[0].reason = note
-
-    # -- leave ---------------------------------------------------------------
-
-    async def leave(self, item_id: str) -> None:
-        entry = self._entries.get(item_id)
-        if entry is None or not entry[0].leavable:
-            raise LeaveFailed("not_eligible", "Not in the current list or not leavable. Reload the list.", False)
-        request = leave_request(entry[1])
-        if request is None:  # defensive: classify() never marks users leavable
-            raise LeaveFailed("unsupported", "Only groups and channels can be left.", False)
+        if entry is None:
+            raise ActionFailed("not_eligible", "Not in the current list. Reload the list.", False)
+        reason = ineligibility(entry.item, action)
+        if reason:
+            raise ActionFailed("not_eligible", reason, False)
+        item = entry.item
         try:
-            await self._client(request)
-        except _FLOOD_ERRORS as e:
-            raise RateLimited(e.seconds) from None
+            if action == LEAVE and entry.is_bot:
+                await self._delete_bot_chat(entry.peer)
+                item.leavable, item.reason = False, "You deleted this chat."
+                message = "Chat deleted (on your side only)."
+                if options.get("block_bots"):
+                    message += " " + await self._block(entry.peer)
+                return "removed", message
+            if action == LEAVE:
+                request = leave_request(entry.peer)
+                if request is None:  # defensive: only groups/channels are leavable
+                    raise ActionFailed("unsupported", "Only groups, channels and bots can be removed.", False)
+                await self._client(request)
+                item.leavable, item.reason = False, "You left this."
+                return "left", "Left (confirmed by Telegram)."
+            if action == ARCHIVE:
+                await self._client(functions.folders.EditPeerFoldersRequest(
+                    [types.InputFolderPeer(peer=entry.peer, folder_id=1)]))
+                item.archived = True
+                return "archived", "Moved to Archive."
+            if action == MUTE:
+                await self._client(functions.account.UpdateNotifySettingsRequest(
+                    peer=types.InputNotifyPeer(entry.peer),
+                    settings=types.InputPeerNotifySettings(mute_until=MUTE_FOREVER)))
+                item.muted = True
+                return "muted", "Muted forever."
+            raise ActionFailed("bad_action", "Unknown action.", False)
         except errors.UserNotParticipantError:
-            raise NotMember() from None
-        except errors.UserCreatorError:
-            raise LeaveFailed("owner", "Telegram: you are the creator, so you can't leave this.", False) from None
-        except errors.ChannelPrivateError:
-            raise LeaveFailed("no_access", "Telegram: no access (you may have been removed or banned).", False) from None
-        except (errors.ChannelInvalidError, errors.ChatIdInvalidError, errors.PeerIdInvalidError,
-                errors.ChannelPublicGroupNaError):
-            raise LeaveFailed("invalid", "Telegram no longer recognizes this chat. Reload the list.", False) from None
+            item.leavable, item.reason = False, "You already left this."
+            return "not_member", "Telegram says you are not a member (already left)."
+        except Exception as e:
+            raise _translate(e) from None
+
+    async def _delete_bot_chat(self, peer) -> None:
+        # Deletes only your copy (revoke=False). Telegram may ask for repeated calls on long histories.
+        for _ in range(100):
+            result = await self._client(functions.messages.DeleteHistoryRequest(
+                peer=peer, max_id=0, just_clear=False, revoke=False))
+            if not getattr(result, "offset", 0):
+                return
+        raise ActionFailed("incomplete", "Telegram kept returning more history to delete. Retry.", True)
+
+    async def _block(self, peer) -> str:
+        try:
+            await self._client(functions.contacts.BlockRequest(id=peer))
+            return "Bot blocked."
+        except _FLOOD_ERRORS as e:
+            return f"Blocking skipped: Telegram rate limit ({e.seconds} s)."
         except errors.RPCError as e:
-            raise LeaveFailed("telegram_error", f"Telegram error: {e.message or type(e).__name__}", True) from None
-        except (OSError, asyncio.TimeoutError):
-            raise LeaveFailed("network", "Connection problem; Telegram did not confirm. Retry to check.", True) from None
+            return f"Blocking failed: {e.message or type(e).__name__}."
+
+    # -- engagement scan (read-only) -----------------------------------------
+
+    async def scan(self, item_id: str) -> tuple[str, str]:
+        entry = self._entries.get(item_id)
+        if entry is None:
+            raise ActionFailed("not_eligible", "Not in the current list. Reload the list.", False)
+        item = entry.item
+        if not item.accessible or item.kind == OTHER:
+            raise ActionFailed("no_access", "Nothing to scan: no access to this chat.", False)
+        try:
+            if item.last_read_at is None and entry.read_max_id > 0:
+                # The newest message at or below your read position.
+                result = await self._client(functions.messages.GetHistoryRequest(
+                    peer=entry.peer, offset_id=entry.read_max_id + 1, offset_date=None, add_offset=0,
+                    limit=1, max_id=0, min_id=0, hash=0))
+                item.last_read_at = _first_date(result)
+            if item.can_post and item.my_last_message_at is None:
+                result = await self._client(functions.messages.SearchRequest(
+                    peer=entry.peer, q="", filter=types.InputMessagesFilterEmpty(), min_date=None, max_date=None,
+                    offset_id=0, add_offset=0, limit=1, max_id=0, min_id=0, hash=0,
+                    from_id=types.InputPeerSelf()))
+                item.my_last_message_at = _first_date(result)
+        except Exception as e:
+            raise _translate(e) from None
+        item.scanned_at = datetime.now(timezone.utc)
+        self._remember_scan(entry)
+        parts = [f"read up to {_short(item.last_read_at)}" if item.last_read_at else "no read position",
+                 (f"you last posted {_short(item.my_last_message_at)}" if item.my_last_message_at else "no messages from you")
+                 if item.can_post else None]
+        return "scanned", "Scanned: " + ", ".join(p for p in parts if p) + "."
+
+    def _read_scan_cache(self) -> dict:
+        path = self._data_dir / SCAN_CACHE
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _remember_scan(self, entry: _Entry) -> None:
+        cache = self._read_scan_cache()
+        item = entry.item
+        cache[item.id] = {"read_max_id": entry.read_max_id, "last_read_at": iso(item.last_read_at),
+                          "my_last_message_at": iso(item.my_last_message_at), "scanned_at": iso(item.scanned_at)}
+        path = self._data_dir / SCAN_CACHE
+        tmp = path.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(cache), encoding="utf-8")
+            make_private(tmp)
+            os.replace(tmp, path)
+        except OSError as e:
+            log.warning("could not save scan cache: %s", type(e).__name__)
+
+
+def _apply_cached_scan(entry: _Entry, cached) -> None:
+    """Reuse an earlier scan while it is still valid.
+
+    Valid while your read position is unchanged: reading or posting in the chat moves it,
+    so a changed position means the stored dates could be too old and are dropped.
+    """
+    if not isinstance(cached, dict) or cached.get("read_max_id") != entry.read_max_id:
+        return
+    item = entry.item
+    item.last_read_at = item.last_read_at or parse_iso(cached.get("last_read_at"))
+    item.my_last_message_at = item.my_last_message_at or parse_iso(cached.get("my_last_message_at"))
+    item.scanned_at = parse_iso(cached.get("scanned_at"))
+
+
+def _first_date(result):
+    for message in getattr(result, "messages", None) or []:
+        date = _valid_date(getattr(message, "date", None))
+        if date:
+            return date
+    return None
+
+
+def _short(value: datetime) -> str:
+    return value.strftime("%Y-%m-%d")
+
+
+def _translate(e: Exception) -> Exception:
+    """Map a Telethon/network exception to RateLimited or ActionFailed."""
+    if isinstance(e, (RateLimited, ActionFailed)):
+        return e
+    if isinstance(e, _FLOOD_ERRORS):
+        return RateLimited(e.seconds)
+    if isinstance(e, errors.UserCreatorError):
+        return ActionFailed("owner", "Telegram: you are the creator, so you can't leave this.", False)
+    if isinstance(e, errors.ChannelPrivateError):
+        return ActionFailed("no_access", "Telegram: no access (you may have been removed or banned).", False)
+    if isinstance(e, (errors.ChannelInvalidError, errors.ChatIdInvalidError, errors.PeerIdInvalidError,
+                      errors.ChannelPublicGroupNaError)):
+        return ActionFailed("invalid", "Telegram no longer recognizes this chat. Reload the list.", False)
+    if isinstance(e, errors.RPCError):
+        return ActionFailed("telegram_error", f"Telegram error: {e.message or type(e).__name__}", True)
+    if isinstance(e, (OSError, asyncio.TimeoutError)):
+        return ActionFailed("network", "Connection problem; Telegram did not confirm. Retry to check.", True)
+    return e  # programming errors propagate unchanged

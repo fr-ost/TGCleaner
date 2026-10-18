@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# Starts the TG Group Cleaner local service.
+# Starts the TG Cleaner local service.
 #   ./start.sh            normal use (runs one-time setup first if needed)
 #   ./start.sh --demo     fake data, never contacts Telegram
 #   ./start.sh setup      re-enter API ID / hash

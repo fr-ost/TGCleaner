@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>TG Group Cleaner</title>
+  <title>TG Cleaner</title>
   <link rel="icon" href="icons/icon32.png">
   <link rel="stylesheet" href="dashboard.css">
   <script type="module" src="dashboard.js"></script>
@@ -12,7 +12,7 @@
   <header class="topbar">
     <div class="brand">
       <img src="icons/icon48.png" alt="" width="28" height="28">
-      <h1>TG Group Cleaner</h1>
+      <h1>TG Cleaner</h1>
       <span id="demoBadge" class="badge badge-demo" hidden title="The service runs with fake data and never contacts Telegram">Demo mode</span>
     </div>
     <div class="conn">
@@ -77,18 +77,27 @@
     <!-- Dashboard -->
     <section id="appView" hidden>
       <div class="stats">
-        <div class="stat"><span class="stat-label">Groups &amp; channels</span><span id="statTotal" class="stat-value">–</span></div>
+        <div class="stat"><span class="stat-label">Groups, channels &amp; bots</span><span id="statTotal" class="stat-value">–</span></div>
         <div class="stat stat-warn"><span class="stat-label" id="statInactiveLabel">Inactive</span><span id="statInactive" class="stat-value">–</span></div>
         <div class="stat stat-muted"><span class="stat-label">Unknown activity</span><span id="statUnknown" class="stat-value">–</span></div>
         <div class="stat stat-accent"><span class="stat-label">Selected</span><span id="statSelected" class="stat-value">0</span></div>
       </div>
       <p id="excludedNote" class="muted small"></p>
 
+      <!-- Engagement scan -->
+      <section id="scanBanner" class="card banner" hidden>
+        <div>
+          <strong id="scanBannerTitle">Scan your activity</strong>
+          <p id="scanBannerText" class="muted small"></p>
+        </div>
+        <button id="scanBannerBtn" class="btn btn-primary btn-sm">Scan my activity</button>
+      </section>
+
       <!-- Leave progress -->
       <section id="progressPanel" class="card progress-card" hidden aria-live="polite">
         <div class="progress-head">
           <div>
-            <h2 id="progressTitle">Leaving…</h2>
+            <h2 id="progressTitle">Working…</h2>
             <p id="progressSub" class="muted small"></p>
           </div>
           <div class="row">
@@ -109,8 +118,15 @@
       <div class="toolbar card">
         <div class="toolbar-row">
           <input id="searchInput" class="search" type="search" placeholder="Search by name or @username" aria-label="Search">
+          <label class="field" title="What counts as inactive">
+            <span>Inactive means</span>
+            <select id="basisSelect">
+              <option value="chat">No new messages in the chat</option>
+              <option value="you">You haven't read or posted</option>
+            </select>
+          </label>
           <label class="field">
-            <span>Inactive for</span>
+            <span>for</span>
             <select id="thresholdSelect">
               <option value="7">7 days</option>
               <option value="30">30 days</option>
@@ -130,7 +146,7 @@
               <option value="inactive">Inactive</option>
               <option value="active">Active</option>
               <option value="unknown">Unknown activity</option>
-              <option value="unavailable">Can't be left</option>
+              <option value="unavailable" id="unavailableOption">Not eligible for the action</option>
             </select>
           </label>
           <label class="field">
@@ -138,9 +154,11 @@
             <select id="kindSelect">
               <option value="all">All types</option>
               <option value="channel">Channels</option>
+              <option value="groups">All groups</option>
               <option value="supergroup">Supergroups</option>
               <option value="group">Basic groups</option>
               <option value="gigagroup">Broadcast groups</option>
+              <option value="bot">Bots</option>
               <option value="other">Other</option>
             </select>
           </label>
@@ -152,6 +170,7 @@
               <option value="name">Name A–Z</option>
               <option value="name_desc">Name Z–A</option>
               <option value="kind">Type</option>
+              <option value="unread">Most unread</option>
             </select>
           </label>
         </div>
@@ -159,26 +178,44 @@
           <button id="selectInactiveBtn" class="btn btn-sm">Select inactive</button>
           <button id="selectAllBtn" class="btn btn-sm">Select all shown</button>
           <button id="deselectAllBtn" class="btn btn-sm">Deselect all</button>
+          <label class="field">
+            <span>Notifications</span>
+            <select id="mutedSelect">
+              <option value="any">Any</option>
+              <option value="muted">Muted</option>
+              <option value="unmuted">Not muted</option>
+            </select>
+          </label>
+          <label class="check small"><input type="checkbox" id="unreadOnly"> Has unread</label>
           <span class="spacer"></span>
           <span id="shownCount" class="muted small"></span>
+          <button id="scanBtn" class="btn btn-sm btn-ghost" title="Read-only: look up when you last read and posted in each chat">Scan my activity</button>
           <button id="reloadBtn" class="btn btn-sm btn-ghost" title="Load the list again from Telegram">Reload list</button>
         </div>
       </div>
 
       <div class="list card" role="region" aria-label="Groups and channels">
         <div class="list-head" aria-hidden="true">
-          <span></span><span>Name</span><span>Type</span><span>Role</span><span>Last message</span><span>Status</span>
+          <span></span><span>Name</span><span>Type</span><span>Last message</span><span>You</span><span>Status</span>
         </div>
         <div id="list" class="list-body"></div>
         <p id="emptyState" class="empty" hidden>Nothing matches these filters.</p>
-        <p id="loadingState" class="empty" hidden>Loading your groups and channels from Telegram…</p>
+        <p id="loadingState" class="empty" hidden>Loading your groups, channels and bots from Telegram…</p>
       </div>
     </section>
   </main>
 
   <footer id="actionBar" class="action-bar" hidden>
     <span id="selectionSummary">Nothing selected</span>
-    <button id="leaveBtn" class="btn btn-danger" disabled>Leave selected</button>
+    <label class="field action-field">
+      <span>Action</span>
+      <select id="actionSelect">
+        <option value="leave">Leave / remove</option>
+        <option value="archive">Archive</option>
+        <option value="mute">Mute</option>
+      </select>
+    </label>
+    <button id="applyBtn" class="btn btn-danger" disabled>Leave selected</button>
   </footer>
 
   <dialog id="confirmDialog" aria-labelledby="confirmTitle">
@@ -190,11 +227,12 @@
         <h3>Will be skipped</h3>
         <ul id="confirmRejected" class="confirm-list rejected"></ul>
       </div>
-      <p class="warn small">Leaving can't be undone here. To rejoin a private group or channel you will need a new invite link.</p>
+      <label id="blockBotsWrap" class="check" hidden><input type="checkbox" id="blockBots"> <span id="blockBotsLabel">Also block these bots</span></label>
+      <p id="confirmNote" class="warn small"></p>
       <p id="confirmError" class="form-error" role="alert"></p>
       <div class="dialog-actions">
         <button value="cancel" class="btn" id="confirmCancel" autofocus>Cancel</button>
-        <button value="confirm" class="btn btn-danger" id="confirmOk">Leave</button>
+        <button value="confirm" class="btn btn-danger" id="confirmOk">Confirm</button>
       </div>
     </form>
   </dialog>

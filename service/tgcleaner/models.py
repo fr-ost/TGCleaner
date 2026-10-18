@@ -1,4 +1,4 @@
-"""Data shared by the Telegram backends, the leave job and the HTTP API."""
+"""Data shared by the Telegram backends, the batch jobs and the HTTP API."""
 
 from __future__ import annotations
 
@@ -11,7 +11,14 @@ CHANNEL = "channel"            # broadcast channel
 SUPERGROUP = "supergroup"      # megagroup
 BROADCAST_GROUP = "gigagroup"  # very large broadcast group
 GROUP = "group"                # legacy basic group
-OTHER = "other"                # anything Telegram adds later; never leavable here
+BOT = "bot"                    # chat with a bot (human private chats are never listed)
+OTHER = "other"                # anything Telegram adds later; never left/removed here
+
+# Cleanup actions.
+LEAVE = "leave"      # leave a group/channel, or delete the chat with a bot
+ARCHIVE = "archive"  # move to the Archive folder
+MUTE = "mute"        # mute notifications forever
+ACTIONS = (LEAVE, ARCHIVE, MUTE)
 
 
 @dataclass
@@ -20,13 +27,20 @@ class DialogItem:
     title: str
     kind: str
     username: str | None
-    last_message_at: datetime | None  # None = no message history available to us
+    last_message_at: datetime | None  # newest message in the chat; None = no history available to us
     role: str                    # owner | admin | member | subscriber | none
     archived: bool
     unread_count: int
     participants_count: int | None
-    leavable: bool
-    reason: str | None = None    # why it can't be left (when leavable is False)
+    leavable: bool               # can the LEAVE action apply?
+    reason: str | None = None    # why LEAVE can't apply
+    muted: bool = False
+    accessible: bool = True      # False when banned/removed: nothing can be done with it
+    can_post: bool = True        # False for channels where you can't post (so "your last message" doesn't apply)
+    # Your own engagement. None = unknown (not determinable from the list; a scan may fill it in).
+    last_read_at: datetime | None = None       # date of the newest message you have read
+    my_last_message_at: datetime | None = None  # date of your newest message there
+    scanned_at: datetime | None = None          # when the engagement scan last looked at this item
 
     @property
     def link(self) -> str | None:
@@ -42,11 +56,32 @@ class DialogItem:
             "last_message_at": iso(self.last_message_at),
             "role": self.role,
             "archived": self.archived,
+            "muted": self.muted,
             "unread_count": self.unread_count,
             "participants_count": self.participants_count,
             "leavable": self.leavable,
             "reason": self.reason,
+            "accessible": self.accessible,
+            "can_post": self.can_post,
+            "last_read_at": iso(self.last_read_at),
+            "my_last_message_at": iso(self.my_last_message_at),
+            "scanned_at": iso(self.scanned_at),
         }
+
+
+def ineligibility(item: DialogItem, action: str) -> str | None:
+    """Why `action` can't be applied to `item`, or None if it can."""
+    if action == LEAVE:
+        return None if item.leavable else (item.reason or "This can't be left here.")
+    if not item.accessible:
+        return "You no longer have access to this."
+    if item.kind == OTHER:
+        return "This type isn't supported by this tool."
+    if action == ARCHIVE:
+        return "Already archived." if item.archived else None
+    if action == MUTE:
+        return "Already muted." if item.muted else None
+    return "Unknown action."
 
 
 def iso(value: datetime | None) -> str | None:
@@ -57,10 +92,19 @@ def iso(value: datetime | None) -> str | None:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 @dataclass
 class DialogList:
     items: list[DialogItem]
-    excluded: dict[str, int]  # private chats, bots and Saved Messages are counted, never listed
+    excluded: dict[str, int]  # private chats and Saved Messages are counted, never listed
     loaded_at: datetime
 
 
@@ -82,11 +126,7 @@ class RateLimited(Exception):
         self.seconds = max(1, int(seconds))
 
 
-class NotMember(Exception):
-    """Telegram reports the account is not a participant (it already left)."""
-
-
-class LeaveFailed(Exception):
+class ActionFailed(Exception):
     def __init__(self, code: str, message: str, retryable: bool):
         super().__init__(message)
         self.code = code
@@ -112,11 +152,14 @@ class Backend(Protocol):
 
     async def load_dialogs(self) -> DialogList: ...
     def cached_item(self, item_id: str) -> DialogItem | None: ...
-    def mark_left(self, item_id: str, note: str) -> None: ...
 
-    async def leave(self, item_id: str) -> None:
-        """Return only after Telegram confirmed the leave.
+    async def perform(self, action: str, item_id: str, options: dict) -> tuple[str, str]:
+        """Apply one action. Returns (status, message) only after Telegram confirmed it.
 
-        Raises RateLimited, NotMember or LeaveFailed otherwise.
+        Raises RateLimited or ActionFailed otherwise.
         """
+        ...
+
+    async def scan(self, item_id: str) -> tuple[str, str]:
+        """Read-only: look up your read position and your last message for one item."""
         ...

@@ -1,5 +1,5 @@
 @echo off
-rem Starts the TG Group Cleaner local service.
+rem Starts the TG Cleaner local service.
 rem   start.bat            normal use (runs one-time setup first if needed)
 rem   start.bat --demo     fake data, never contacts Telegram
 rem   start.bat setup      re-enter API ID / hash

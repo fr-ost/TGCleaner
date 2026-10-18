@@ -1,17 +1,31 @@
 {
   "manifest_version": 3,
-  "name": "TG Group Cleaner (personal)",
+  "name": "TG Cleaner (personal)",
   "short_name": "TG Cleaner",
-  "version": "1.0.0",
-  "description": "Find inactive Telegram groups and channels and leave the ones you choose. Talks only to your local service on 127.0.0.1.",
+  "version": "1.1.0",
+  "description": "Find inactive Telegram groups, channels and bots, or chats you ignore, then leave, archive or mute them. Talks only to your local service on 127.0.0.1.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqy/DgXOj7fUipKJiu+YBvItonnLiEahtSgx+Mi3H9gKs3AkDbdQX0V6cKW5b8dZtITZiIsfec8HAiQL6vZKlYzLaJsDxhrg5C01HalCDIKyGO/d4+GuHp/gfG0hyftwgOpvNDyxIb0o/s7encuDpieP8OYIXQrjgJ+bhqWgsoVougvybQzdsMzYfTAwdXoSHcozhft2oEJKcyGzo5BtNUyTBaLe3NjElIR3DmExOfVsoVk+vQcOB0CC3IZsYeup4KkfofSsQ68M1uQARDqJgmV3I1nzjWGswg0M3eV5hKTiHRAwEv1rMfGd2/OLt3BKRIsyWi06vX6qa0DjP51pEhQIDAQAB",
   "action": {
-    "default_title": "Open TG Group Cleaner",
-    "default_icon": { "16": "icons/icon16.png", "32": "icons/icon32.png", "48": "icons/icon48.png" }
+    "default_title": "Open TG Cleaner",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png"
+    }
   },
-  "icons": { "16": "icons/icon16.png", "32": "icons/icon32.png", "48": "icons/icon48.png", "128": "icons/icon128.png" },
-  "background": { "service_worker": "background.js", "type": "module" },
-  "permissions": ["storage"],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": [
+    "storage"
+  ],
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; connect-src http://127.0.0.1:*"
   }

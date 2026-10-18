@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
-  activityOf, daysSince, formatAgo, inactiveIds, matchesFilters, parseThreshold, pruneSelection,
-  retryableIds, selectableIds, sortItems, summarize,
+  activityOf, daysSince, engagementIso, formatAgo, formatDuration, inactiveIds, ineligibility, matchesFilters,
+  needsScan, parseThreshold, pruneSelection, retryableIds, selectableIds, sortItems, summarize,
 } from "../../extension/logic.js";
 
 const NOW = Date.parse("2026-10-01T00:00:00Z");
@@ -55,7 +55,8 @@ test("sorting puts unknown activity last", () => {
 });
 
 test("summary counts", () => {
-  assert.deepEqual(summarize(items, 30, NOW), { total: 5, inactive: 3, active: 1, unknown: 1, unavailable: 1, inactiveSelectable: 2 });
+  const s = summarize(items, 30, NOW);
+  assert.deepEqual([s.total, s.inactive, s.active, s.unknown, s.unavailable, s.inactiveSelectable], [5, 3, 1, 1, 1, 2]);
 });
 
 test("parseThreshold", () => {
@@ -87,4 +88,75 @@ test("formatAgo", () => {
   assert.equal(formatAgo(10.7), "10 days ago");
   assert.equal(formatAgo(400), "13 months ago");
   assert.equal(formatAgo(1000), "2 years ago");
+});
+
+// --- bots, engagement ("you haven't read or posted"), archive / mute ---
+
+const busyIgnored = {
+  id: "-10", title: "Busy But Ignored", kind: "supergroup", leavable: true, can_post: true, unread_count: 900,
+  last_message_at: daysAgo(0.5), last_read_at: daysAgo(200), my_last_message_at: daysAgo(400), scanned_at: daysAgo(1),
+  muted: true, archived: false,
+};
+const busyRead = {
+  id: "-11", title: "Busy And Read", kind: "supergroup", leavable: true, can_post: true, unread_count: 0,
+  last_message_at: daysAgo(0.5), last_read_at: daysAgo(0.5), my_last_message_at: null, scanned_at: null,
+  muted: false, archived: true,
+};
+const oldBot = {
+  id: "77", title: "Weather Bot", kind: "bot", leavable: true, can_post: true, unread_count: 0,
+  last_message_at: daysAgo(500), last_read_at: daysAgo(500), my_last_message_at: daysAgo(510), muted: false, archived: false,
+};
+const unscanned = {
+  id: "-12", title: "Unscanned", kind: "channel", leavable: true, can_post: false, unread_count: 30,
+  last_message_at: daysAgo(1), last_read_at: null, my_last_message_at: null, scanned_at: null, muted: false, archived: false,
+};
+const pool = [busyIgnored, busyRead, oldBot, unscanned];
+
+test("engagement uses the newer of your last read and your last message", () => {
+  assert.equal(engagementIso(busyIgnored), busyIgnored.last_read_at);
+  assert.equal(engagementIso({ last_read_at: daysAgo(50), my_last_message_at: daysAgo(3) }), daysAgo(3));
+  assert.equal(engagementIso(unscanned), null);
+});
+
+test("an active chat you ignore is inactive on the 'you' basis only", () => {
+  assert.equal(activityOf(busyIgnored, 90, NOW, "chat"), "active");
+  assert.equal(activityOf(busyIgnored, 90, NOW, "you"), "inactive");
+  assert.equal(activityOf(busyRead, 90, NOW, "you"), "active");
+  assert.equal(activityOf(unscanned, 90, NOW, "you"), "unknown");
+  assert.deepEqual(inactiveIds(pool, 90, NOW, "you"), ["-10", "77"]);
+  assert.deepEqual(inactiveIds(pool, 90, NOW, "chat"), ["77"]);
+});
+
+test("needsScan", () => {
+  assert.equal(needsScan(unscanned), true);
+  assert.equal(needsScan(busyIgnored), false); // already scanned
+  assert.equal(needsScan(busyRead), true); // can post, own last message unknown
+  assert.equal(needsScan(oldBot), false); // everything known for free
+  assert.equal(needsScan({ ...unscanned, accessible: false }), false);
+});
+
+test("eligibility per action", () => {
+  assert.equal(ineligibility(busyRead, "archive"), "Already archived.");
+  assert.equal(ineligibility(busyIgnored, "mute"), "Already muted.");
+  assert.equal(ineligibility(busyIgnored, "archive"), null);
+  assert.equal(ineligibility({ ...items[3], accessible: true, archived: false }, "archive"), null); // owners can archive
+  assert.equal(ineligibility({ ...items[3], accessible: false }, "mute"), "You no longer have access to this.");
+  assert.deepEqual(selectableIds(pool, "mute"), ["-11", "77", "-12"]);
+  assert.deepEqual([...pruneSelection(new Set(["-10", "-11"]), pool, "archive")], ["-10"]);
+});
+
+test("bot, muted and unread filters", () => {
+  const f = (over) => pool.filter((it) => matchesFilters(it, { query: "", show: "all", kind: "all", threshold: 90, ...over }, NOW)).map((it) => it.id);
+  assert.deepEqual(f({ kind: "bot" }), ["77"]);
+  assert.deepEqual(f({ kind: "groups" }), ["-10", "-11"]);
+  assert.deepEqual(f({ muted: "muted" }), ["-10"]);
+  assert.deepEqual(f({ unreadOnly: true }), ["-10", "-12"]);
+  assert.deepEqual(f({ show: "unavailable", action: "archive" }), ["-11"]);
+  assert.deepEqual(sortItems(pool, "unread").map((i) => i.id), ["-10", "-12", "-11", "77"]);
+  assert.deepEqual(sortItems(pool, "oldest", "you").map((i) => i.id), ["77", "-10", "-11", "-12"]);
+});
+
+test("formatDuration", () => {
+  assert.equal(formatDuration(40), "40 s");
+  assert.equal(formatDuration(600), "10 min");
 });

@@ -28,8 +28,9 @@ class ApiTestCase(unittest.IsolatedAsyncioTestCase):
         self.port = free_port()
         self.cfg = Config(api_id=1, api_hash="0" * 32, port=self.port)
         self.cfg.leave_delay_seconds = 0  # tests only; real config enforces >= 0.5 s
-        self.items = demo_items(120, seed=3)
-        self.backend = FakeBackend(self.items, authorized=self.authorized, require_password=True)
+        self.cfg.scan_delay_seconds = 0
+        self.items, truth = demo_items(120, seed=3, bots=10)
+        self.backend = FakeBackend(self.items, truth, authorized=self.authorized, require_password=True)
         self.server = TestServer(create_app(self.cfg, self.backend, demo=True), host="127.0.0.1", port=self.port)
         await self.server.start_server()
         self.http = ClientSession()
@@ -52,7 +53,7 @@ class ApiTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def wait_job(self, timeout=20):
         for _ in range(int(timeout / 0.05)):
-            _, body, _ = await self.get("/api/leave/job")
+            _, body, _ = await self.get("/api/job")
             if body["job"] and body["job"]["state"] not in ("running", "waiting"):
                 return body["job"]
             await asyncio.sleep(0.05)
@@ -83,14 +84,14 @@ class SecurityTests(ApiTestCase):
         self.assertEqual((status, body["error"]), (403, "bad_host"))
 
     async def test_preflight(self):
-        ok = await self.call("OPTIONS", "/api/leave/prepare", headers={
+        ok = await self.call("OPTIONS", "/api/actions/prepare", headers={
             "Origin": ORIGIN, "Access-Control-Request-Method": "POST",
             "Access-Control-Request-Headers": "content-type,x-tgcleaner",
             "Access-Control-Request-Private-Network": "true"})
         self.assertEqual(ok[0], 204)
         self.assertEqual(ok[2]["Access-Control-Allow-Origin"], ORIGIN)
         self.assertEqual(ok[2]["Access-Control-Allow-Private-Network"], "true")
-        evil = await self.call("OPTIONS", "/api/leave/prepare", headers={
+        evil = await self.call("OPTIONS", "/api/actions/prepare", headers={
             "Origin": "https://evil.example", "Access-Control-Request-Method": "POST"})
         self.assertEqual(evil[0], 403)
         self.assertNotIn("Access-Control-Allow-Origin", evil[2])
@@ -99,7 +100,7 @@ class SecurityTests(ApiTestCase):
         status, _, _ = await self.call("POST", "/api/login/phone", data="phone=1",
                                        headers=HEADERS | {"Content-Type": "application/x-www-form-urlencoded"})
         self.assertEqual(status, 415)
-        status, _, _ = await self.post("/api/leave/prepare", json={"ids": ["-1"] * 20000})
+        status, _, _ = await self.post("/api/actions/prepare", json={"ids": ["-1"] * 20000})
         self.assertEqual(status, 413)
 
     async def test_responses_carry_cors_for_extension_and_no_store(self):
@@ -160,27 +161,29 @@ class LeaveFlowTests(ApiTestCase):
 
     async def test_dialog_list_shape(self):
         body = await self.load()
-        self.assertEqual(len(body["items"]), 120)
+        self.assertEqual(len(body["items"]), 130)
+        self.assertEqual(sum(it["kind"] == "bot" for it in body["items"]), 10)
         self.assertEqual(body["excluded"]["saved_messages"], 1)
         item = body["items"][0]
-        for key in ("id", "title", "kind", "username", "link", "last_message_at", "role", "leavable", "reason"):
+        for key in ("id", "title", "kind", "username", "link", "last_message_at", "role", "leavable", "reason",
+                    "muted", "archived", "last_read_at", "my_last_message_at", "scanned_at", "can_post"):
             self.assertIn(key, item)
         self.assertTrue(any(it["last_message_at"] is None for it in body["items"]))
 
     async def test_prepare_requires_loaded_list_and_valid_ids(self):
-        status, body, _ = await self.post("/api/leave/prepare", {"ids": ["-1001000000001"]})
+        status, body, _ = await self.post("/api/actions/prepare", {"action": "leave", "ids": ["-1001000000001"]})
         self.assertEqual((status, body["error"]), (409, "no_list"))
         await self.load()
         for bad in ([], "x", [123], ["abc"], ["--1"], ["1;drop"], None):
-            status, body, _ = await self.post("/api/leave/prepare", {"ids": bad})
+            status, body, _ = await self.post("/api/actions/prepare", {"action": "leave", "ids": bad})
             self.assertEqual(status, 400, bad)
 
     async def test_prepare_separates_ineligible_items_and_dedupes(self):
         body = await self.load()
         leavable = [it["id"] for it in body["items"] if it["leavable"]][:3]
         owned = next(it for it in body["items"] if it["role"] == "owner")
-        status, prep, _ = await self.post("/api/leave/prepare",
-                                          {"ids": leavable + [leavable[0], owned["id"], "-1009999999999"]})
+        status, prep, _ = await self.post("/api/actions/prepare",
+                                          {"action": "leave", "ids": leavable + [leavable[0], owned["id"], "-1009999999999"]})
         self.assertEqual(status, 200)
         self.assertEqual([it["id"] for it in prep["items"]], leavable)
         self.assertEqual({r["id"] for r in prep["rejected"]}, {owned["id"], "-1009999999999"})
@@ -190,7 +193,7 @@ class LeaveFlowTests(ApiTestCase):
     async def test_nothing_leavable_gives_no_token(self):
         body = await self.load()
         owned = next(it for it in body["items"] if not it["leavable"])
-        _, prep, _ = await self.post("/api/leave/prepare", {"ids": [owned["id"]]})
+        _, prep, _ = await self.post("/api/actions/prepare", {"action": "leave", "ids": [owned["id"]]})
         self.assertIsNone(prep["token"])
 
     async def test_bulk_leave_60_with_partial_failures_and_flood_wait(self):
@@ -203,18 +206,18 @@ class LeaveFlowTests(ApiTestCase):
             ids[20]: [("flood", 1), "ok"],
             ids[30]: ["not_member"],
         }
-        _, prep, _ = await self.post("/api/leave/prepare", {"ids": ids})
+        _, prep, _ = await self.post("/api/actions/prepare", {"action": "leave", "ids": ids})
         self.assertEqual(len(prep["items"]), 60)
-        status, job, _ = await self.post("/api/leave/start", {"token": prep["token"]})
+        status, job, _ = await self.post("/api/actions/start", {"token": prep["token"]})
         self.assertEqual((status, job["total"]), (200, 60))
 
         # While running: no second job, no reload, no reusing the token, no logout.
-        status, body2, _ = await self.post("/api/leave/start", {"token": prep["token"]})
+        status, body2, _ = await self.post("/api/actions/start", {"token": prep["token"]})
         self.assertEqual(status, 409)
-        status, _, _ = await self.post("/api/leave/prepare", {"ids": ids})
+        status, _, _ = await self.post("/api/actions/prepare", {"action": "leave", "ids": ids})
         self.assertEqual(status, 409)
         status, during, _ = await self.get("/api/dialogs")  # cached copy, no refetch
-        self.assertEqual((status, during["cached"], len(during["items"])), (200, True, 120))
+        self.assertEqual((status, during["cached"], len(during["items"])), (200, True, 130))
         status, _, _ = await self.post("/api/logout")
         self.assertEqual(status, 409)
 
@@ -232,10 +235,10 @@ class LeaveFlowTests(ApiTestCase):
 
         # Retry: only the retryable failure is eligible; left items are rejected.
         retry = [it["id"] for it in job["items"] if it["status"] == "failed" and it["retryable"]]
-        _, prep2, _ = await self.post("/api/leave/prepare", {"ids": retry + [ids[0]]})
+        _, prep2, _ = await self.post("/api/actions/prepare", {"action": "leave", "ids": retry + [ids[0]]})
         self.assertEqual([it["id"] for it in prep2["items"]], [ids[10]])
         self.assertEqual([r["id"] for r in prep2["rejected"]], [ids[0]])
-        await self.post("/api/leave/start", {"token": prep2["token"]})
+        await self.post("/api/actions/start", {"token": prep2["token"]})
         job2 = await self.wait_job()
         self.assertEqual(job2["counts"], {"left": 1})
 
@@ -243,10 +246,10 @@ class LeaveFlowTests(ApiTestCase):
         body = await self.load()
         ids = [it["id"] for it in body["items"] if it["leavable"]][:50]
         self.cfg.leave_delay_seconds = 0.05
-        _, prep, _ = await self.post("/api/leave/prepare", {"ids": ids})
-        await self.post("/api/leave/start", {"token": prep["token"]})
+        _, prep, _ = await self.post("/api/actions/prepare", {"action": "leave", "ids": ids})
+        await self.post("/api/actions/start", {"token": prep["token"]})
         await asyncio.sleep(0.2)
-        status, _, _ = await self.post("/api/leave/cancel")
+        status, _, _ = await self.post("/api/job/cancel")
         self.assertEqual(status, 200)
         job = await self.wait_job()
         self.assertEqual(job["state"], "cancelled")
@@ -257,22 +260,130 @@ class LeaveFlowTests(ApiTestCase):
         body = await self.load()
         ids = [it["id"] for it in body["items"] if it["leavable"]][:4]
         self.backend.script = {ids[1]: [("flood", 5000)]}
-        _, prep, _ = await self.post("/api/leave/prepare", {"ids": ids})
-        await self.post("/api/leave/start", {"token": prep["token"]})
+        _, prep, _ = await self.post("/api/actions/prepare", {"action": "leave", "ids": ids})
+        await self.post("/api/actions/start", {"token": prep["token"]})
         job = await self.wait_job()
         self.assertEqual(job["state"], "stopped_rate_limited")
         self.assertEqual(job["counts"], {"left": 1, "rate_limited": 3})
-        status, body, _ = await self.post("/api/leave/prepare", {"ids": ids[1:]})
+        status, body, _ = await self.post("/api/actions/prepare", {"action": "leave", "ids": ids[1:]})
         self.assertEqual((status, body["error"]), (429, "rate_limited"))
 
     async def test_reload_invalidates_tokens(self):
         body = await self.load()
         ids = [it["id"] for it in body["items"] if it["leavable"]][:2]
-        _, prep, _ = await self.post("/api/leave/prepare", {"ids": ids})
+        _, prep, _ = await self.post("/api/actions/prepare", {"action": "leave", "ids": ids})
         await self.load()
-        status, body, _ = await self.post("/api/leave/start", {"token": prep["token"]})
+        status, body, _ = await self.post("/api/actions/start", {"token": prep["token"]})
         self.assertEqual((status, body["error"]), (409, "bad_token"))
         self.assertEqual(self.backend.leave_calls, [])
+
+
+class CleanupActionTests(ApiTestCase):
+    async def load(self):
+        status, body, _ = await self.get("/api/dialogs")
+        self.assertEqual(status, 200)
+        return body["items"]
+
+    async def run_action(self, action, ids, options=None):
+        status, prep, _ = await self.post("/api/actions/prepare", {"action": action, "ids": ids})
+        self.assertEqual(status, 200, prep)
+        if prep["token"]:
+            status, job, _ = await self.post("/api/actions/start", {"token": prep["token"], "options": options or {}})
+            self.assertEqual(status, 200, job)
+            self.assertEqual(job["kind"], action)
+            return prep, await self.wait_job()
+        return prep, None
+
+    async def test_unknown_action_and_bad_options(self):
+        items = await self.load()
+        status, body, _ = await self.post("/api/actions/prepare", {"action": "delete_everything", "ids": [items[0]["id"]]})
+        self.assertEqual(status, 400)
+        leavable = [it["id"] for it in items if it["leavable"]][:1]
+        _, prep, _ = await self.post("/api/actions/prepare", {"action": "leave", "ids": leavable})
+        for options in ("yes", {"block_bots": "true"}):
+            status, _, _ = await self.post("/api/actions/start", {"token": prep["token"], "options": options})
+            self.assertEqual(status, 400, options)
+        self.assertEqual(self.backend.calls, [])
+
+    async def test_archive_allows_owned_chats_and_skips_already_archived(self):
+        items = await self.load()
+        owned = next(it for it in items if it["role"] == "owner" and not it["archived"])
+        archived = next(it for it in items if it["archived"])
+        prep, job = await self.run_action("archive", [owned["id"], archived["id"]])
+        self.assertEqual([r["id"] for r in prep["rejected"]], [archived["id"]])
+        self.assertEqual(job["counts"], {"archived": 1})
+        items = await self.load()
+        self.assertTrue(next(it for it in items if it["id"] == owned["id"])["archived"])
+        prep, job = await self.run_action("archive", [owned["id"]])  # second time: nothing to do
+        self.assertIsNone(prep["token"])
+
+    async def test_mute(self):
+        items = await self.load()
+        unmuted = [it["id"] for it in items if not it["muted"] and it["accessible"]][:5]
+        _, job = await self.run_action("mute", unmuted)
+        self.assertEqual(job["counts"], {"muted": 5})
+        self.assertEqual({a for a, _ in self.backend.calls}, {"mute"})
+
+    async def test_remove_bots_with_and_without_blocking(self):
+        items = await self.load()
+        bots = [it["id"] for it in items if it["kind"] == "bot"]
+        _, job = await self.run_action("leave", bots[:2], {"block_bots": True})
+        self.assertEqual(job["counts"], {"removed": 2})
+        self.assertEqual(self.backend.blocked, bots[:2])
+        self.assertIn("Bot blocked", job["items"][0]["message"])
+        _, job = await self.run_action("leave", bots[2:4])
+        self.assertEqual(job["counts"], {"removed": 2})
+        self.assertEqual(self.backend.blocked, bots[:2])  # not blocked without the option
+        ids_after = {it["id"] for it in await self.load()}
+        self.assertFalse(ids_after & set(bots[:4]))  # deleted chats are gone after reload
+
+    async def test_scan_fills_engagement_and_is_read_only(self):
+        items = await self.load()
+        needing = [it for it in items if it["accessible"] and it["kind"] != "other" and
+                   (it["last_read_at"] is None or (it["can_post"] and it["my_last_message_at"] is None))]
+        status, job, _ = await self.post("/api/scan/start", {})
+        self.assertEqual((status, job["kind"], job["total"]), (200, "scan", len(needing)))
+        job = await self.wait_job()
+        self.assertEqual(job["counts"], {"scanned": len(needing)})
+        self.assertEqual({a for a, _ in self.backend.calls}, {"scan"})  # nothing but reads
+        items = await self.load()
+        self.assertTrue(all(it["scanned_at"] for it in items if it["id"] in {n["id"] for n in needing}))
+        ignored = [it for it in items if it["unread_count"] > 0 and it["last_read_at"]]
+        self.assertTrue(ignored)  # busy chats you stopped reading now have a known read position
+        status, body, _ = await self.post("/api/scan/start", {})
+        self.assertEqual((status, body["error"]), (409, "nothing_to_do"))
+        calls = len(self.backend.calls)
+        status, cached, _ = await self.get("/api/dialogs?cached=1")
+        self.assertEqual((status, cached["cached"]), (200, True))
+        self.assertEqual(len(self.backend.calls), calls)
+        status, job, _ = await self.post("/api/scan/start", {"ids": [items[0]["id"]]})  # explicit rescan
+        self.assertEqual(status, 200)
+        await self.wait_job()
+
+    async def test_rate_limit_on_scan_does_not_block_actions(self):
+        items = await self.load()
+        first = items[0]["id"]
+        self.backend.scan_script = {first: [("flood", 5000)]}
+        await self.post("/api/scan/start", {"ids": [first]})
+        job = await self.wait_job()
+        self.assertEqual(job["state"], "stopped_rate_limited")
+        status, body, _ = await self.post("/api/scan/start", {"ids": [first]})
+        self.assertEqual((status, body["error"]), (429, "rate_limited"))
+        unmuted = [it["id"] for it in items if not it["muted"] and it["accessible"]][:1]
+        _, job = await self.run_action("mute", unmuted)
+        self.assertEqual(job["counts"], {"muted": 1})
+
+    async def test_only_one_job_at_a_time(self):
+        await self.load()
+        self.cfg.scan_delay_seconds = 0.2
+        status, _, _ = await self.post("/api/scan/start", {})
+        self.assertEqual(status, 200)
+        items = (await self.get("/api/dialogs"))[1]["items"]
+        status, body, _ = await self.post("/api/actions/prepare", {"action": "mute", "ids": [items[0]["id"]]})
+        self.assertEqual((status, body["error"]), (409, "job_active"))
+        await self.post("/api/job/cancel")
+        job = await self.wait_job()
+        self.assertEqual(job["state"], "cancelled")
 
 
 if __name__ == "__main__":

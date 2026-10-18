@@ -1,3 +1,3 @@
-"""TG Group Cleaner: a personal, local-only tool for leaving inactive Telegram groups and channels."""
+"""TG Cleaner: a personal, local-only tool for cleaning up Telegram groups, channels and bots."""
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

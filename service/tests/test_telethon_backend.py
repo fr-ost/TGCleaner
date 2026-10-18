@@ -4,18 +4,20 @@ No network access: the fake client records every request instead of sending it.
 """
 
 import asyncio
+import json
 import logging
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 from telethon import errors, functions, types
 
+from tgcleaner import telegram_backend
 from tgcleaner.config import Config
-from tgcleaner.models import LeaveFailed, NotMember, RateLimited, ServiceError
-from tgcleaner.telegram_backend import TelethonBackend, classify, leave_request
+from tgcleaner.models import ARCHIVE, LEAVE, MUTE, ActionFailed, RateLimited, ServiceError
+from tgcleaner.telegram_backend import MUTE_FOREVER, TelethonBackend, classify, leave_request
 
 NOW = datetime(2026, 10, 1, tzinfo=timezone.utc)
 PHOTO = types.ChatPhotoEmpty()
@@ -32,30 +34,37 @@ def chat(cid=222, **kw):
 
 
 def user(uid=333, **kw):
-    return types.User(id=uid, access_hash=1, first_name="Someone", **kw)
+    return types.User(id=uid, access_hash=1, first_name=kw.pop("first_name", "Someone"), **kw)
 
 
-def c(entity, last=NOW):
-    return classify(entity, last_date=last, archived=False, unread_count=0)
+def c(entity, last=NOW, **kw):
+    kw.setdefault("unread_count", 3)
+    return classify(entity, last_date=last, archived=False, **kw)
 
 
 class ClassifyTests(unittest.TestCase):
-    def test_private_chats_bots_and_saved_messages_are_never_listed(self):
+    def test_human_private_chats_and_saved_messages_are_never_listed(self):
         self.assertEqual(c(user()), "private_chat")
-        self.assertEqual(c(user(bot=True)), "bot")
         self.assertEqual(c(user(is_self=True)), "saved_messages")
+        self.assertEqual(c(user(deleted=True)), "private_chat")
+
+    def test_bots_are_listed_and_removable(self):
+        item = c(user(444, bot=True, first_name="Weather", username="weatherbot"))
+        self.assertEqual((item.kind, item.id, item.title, item.leavable, item.can_post), ("bot", "444", "Weather", True, True))
+        self.assertEqual(item.link, "https://t.me/weatherbot")
 
     def test_broadcast_channel(self):
         item = c(channel(broadcast=True, username="news"))
-        self.assertEqual((item.kind, item.role, item.leavable), ("channel", "subscriber", True))
+        self.assertEqual((item.kind, item.role, item.leavable, item.can_post), ("channel", "subscriber", True, False))
         self.assertEqual(item.id, "-1000000000111")
         self.assertEqual(item.link, "https://t.me/news")
+        poster = c(channel(broadcast=True, admin_rights=types.ChatAdminRights(post_messages=True)))
+        self.assertTrue(poster.can_post)
 
     def test_supergroup_admin_and_gigagroup(self):
         admin = c(channel(megagroup=True, admin_rights=types.ChatAdminRights()))
-        self.assertEqual((admin.kind, admin.role, admin.leavable), ("supergroup", "admin", True))
-        giga = c(channel(megagroup=True, gigagroup=True))
-        self.assertEqual(giga.kind, "gigagroup")
+        self.assertEqual((admin.kind, admin.role, admin.leavable, admin.can_post), ("supergroup", "admin", True, True))
+        self.assertEqual(c(channel(megagroup=True, gigagroup=True)).kind, "gigagroup")
 
     def test_secondary_usernames(self):
         item = c(channel(megagroup=True, usernames=[types.Username("old", active=False),
@@ -78,8 +87,9 @@ class ClassifyTests(unittest.TestCase):
             self.assertFalse(c(entity).leavable)
 
     def test_forbidden_and_unknown_entity_types(self):
-        self.assertFalse(c(types.ChatForbidden(id=5, title="Gone")).leavable)
-        self.assertFalse(c(types.ChannelForbidden(id=6, access_hash=1, title="Banned")).leavable)
+        gone = c(types.ChatForbidden(id=5, title="Gone"))
+        self.assertEqual((gone.leavable, gone.accessible), (False, False))
+        self.assertFalse(c(types.ChannelForbidden(id=6, access_hash=1, title="Banned")).accessible)
         community = types.Community(id=7, title="Community", photo=PHOTO, date=NOW, access_hash=1)
         item = c(community)
         self.assertEqual(item.kind, "other")
@@ -90,6 +100,15 @@ class ClassifyTests(unittest.TestCase):
         self.assertIsNone(c(channel(), last=datetime(1970, 1, 1, tzinfo=timezone.utc)).last_message_at)
         naive = c(channel(), last=datetime(2026, 1, 1)).last_message_at
         self.assertEqual(naive.tzinfo, timezone.utc)
+
+    def test_free_engagement_signals(self):
+        behind = c(channel(megagroup=True), unread_count=50)
+        self.assertIsNone(behind.last_read_at)       # needs a scan
+        self.assertIsNone(behind.my_last_message_at)
+        caught_up = c(channel(megagroup=True), unread_count=0, last_is_mine=True, muted=True)
+        self.assertEqual(caught_up.last_read_at, NOW)  # you've read the newest message
+        self.assertEqual(caught_up.my_last_message_at, NOW)
+        self.assertTrue(caught_up.muted)
 
 
 class LeaveRequestTests(unittest.TestCase):
@@ -118,6 +137,8 @@ class FakeClient:
         self.authorized = authorized
         self.requests = []
         self.raise_next = []
+        self.responses = []  # queued return values for the next requests
+        self.fail_on = {}    # request class -> exception raised whenever it is sent
         self.connected = False
         self.iter_kwargs = None
         self._phone_code_hash = {}
@@ -142,12 +163,18 @@ class FakeClient:
 
     async def __call__(self, request):
         self.requests.append(request)
+        if type(request) in self.fail_on:
+            raise self.fail_on[type(request)]
         if self.raise_next:
             raise self.raise_next.pop(0)
+        if self.responses:
+            return self.responses.pop(0)
         if isinstance(request, functions.auth.SendCodeRequest):
             return types.auth.SentCode(type=types.auth.SentCodeTypeApp(length=5), phone_code_hash="HASH")
         if isinstance(request, functions.account.GetPasswordRequest):
             return SimpleNamespace(hint="my hint")
+        if isinstance(request, functions.messages.DeleteHistoryRequest):
+            return types.messages.AffectedHistory(pts=1, pts_count=1, offset=0)
         return types.Updates(updates=[], users=[], chats=[], date=NOW, seq=0)
 
     async def iter_dialogs(self, **kwargs):
@@ -167,8 +194,19 @@ class FakeClient:
         return True
 
 
-def dialog(entity, input_entity, date=NOW):
-    return SimpleNamespace(entity=entity, input_entity=input_entity, date=date, archived=False, unread_count=0)
+def dialog(entity, input_entity, date=NOW, unread=7, read_max=500, out=False, mute_until=None):
+    raw = SimpleNamespace(read_inbox_max_id=read_max, notify_settings=types.PeerNotifySettings(mute_until=mute_until))
+    return SimpleNamespace(entity=entity, input_entity=input_entity, date=date, archived=False, unread_count=unread,
+                           dialog=raw, message=SimpleNamespace(out=out, date=date))
+
+
+def messages(*dates):
+    return types.messages.Messages(
+        messages=[types.Message(id=i + 1, peer_id=types.PeerUser(1), date=d, message="x") for i, d in enumerate(dates)],
+        topics=[], chats=[], users=[])
+
+
+CH, GR, OWNED, BOT_ID = "-1000000000111", "-222", "-1000000000333", "555"
 
 
 class BackendTests(unittest.IsolatedAsyncioTestCase):
@@ -178,8 +216,9 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.cfg = Config(api_id=12345, api_hash="a" * 32)
         self.client = FakeClient(dialogs=[
             dialog(channel(111, broadcast=True), types.InputPeerChannel(111, 999)),
-            dialog(chat(222), types.InputPeerChat(222)),
-            dialog(channel(333, megagroup=True, creator=True), types.InputPeerChannel(333, 1)),
+            dialog(chat(222), types.InputPeerChat(222), unread=0, out=True),
+            dialog(channel(333, megagroup=True, creator=True), types.InputPeerChannel(333, 1),
+                   mute_until=NOW + timedelta(days=36500)),
             dialog(user(444), types.InputPeerUser(444, 1)),
             dialog(user(555, bot=True), types.InputPeerUser(555, 1)),
             dialog(user(42, is_self=True), types.InputPeerSelf()),
@@ -190,11 +229,15 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.tmp.cleanup()
 
-    async def test_load_dialogs_lists_only_groups_and_channels(self):
+    async def test_load_dialogs_lists_groups_channels_and_bots_only(self):
         result = await self.backend.load_dialogs()
-        self.assertEqual([it.id for it in result.items], ["-1000000000111", "-222", "-1000000000333"])
-        self.assertEqual(result.excluded, {"private_chat": 1, "bot": 1, "saved_messages": 1})
+        self.assertEqual([it.id for it in result.items], [CH, GR, OWNED, BOT_ID])
+        self.assertEqual(result.excluded, {"private_chat": 1, "saved_messages": 1})
         self.assertEqual(self.client.iter_kwargs, {"ignore_migrated": True})
+        by_id = {it.id: it for it in result.items}
+        self.assertTrue(by_id[OWNED].muted)
+        self.assertFalse(by_id[CH].muted)
+        self.assertEqual(by_id[GR].my_last_message_at, NOW)
 
     async def test_load_requires_login(self):
         self.client.authorized = False
@@ -204,42 +247,145 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_leave_channel_and_group_send_the_right_requests(self):
         await self.backend.load_dialogs()
-        await self.backend.leave("-1000000000111")
-        await self.backend.leave("-222")
+        self.assertEqual((await self.backend.perform(LEAVE, CH, {}))[0], "left")
+        self.assertEqual((await self.backend.perform(LEAVE, GR, {}))[0], "left")
         self.assertIsInstance(self.client.requests[0], functions.channels.LeaveChannelRequest)
         self.assertIsInstance(self.client.requests[1], functions.messages.DeleteChatUserRequest)
+        with self.assertRaises(ActionFailed):  # already left: never sent twice
+            await self.backend.perform(LEAVE, CH, {})
+        self.assertEqual(len(self.client.requests), 2)
 
-    async def test_ineligible_or_unknown_ids_never_reach_telegram(self):
+    async def test_bot_chat_is_deleted_on_your_side_only_and_optionally_blocked(self):
         await self.backend.load_dialogs()
-        for item_id in ("-1000000000333", "444", "42", "-1000000999999"):
-            with self.assertRaises(LeaveFailed) as ctx:
-                await self.backend.leave(item_id)
-            self.assertFalse(ctx.exception.retryable)
+        self.client.responses = [types.messages.AffectedHistory(pts=1, pts_count=100, offset=5),
+                                 types.messages.AffectedHistory(pts=2, pts_count=3, offset=0)]
+        status, message = await self.backend.perform(LEAVE, BOT_ID, {"block_bots": True})
+        self.assertEqual(status, "removed")
+        self.assertIn("Bot blocked", message)
+        deletes = [r for r in self.client.requests if isinstance(r, functions.messages.DeleteHistoryRequest)]
+        self.assertEqual(len(deletes), 2)  # repeated while Telegram reports more to delete
+        self.assertTrue(all(d.revoke is False and d.just_clear is False and d.max_id == 0 for d in deletes))
+        self.assertIsInstance(self.client.requests[-1], functions.contacts.BlockRequest)
+
+    async def test_bot_chat_deleted_without_blocking_by_default(self):
+        await self.backend.load_dialogs()
+        await self.backend.perform(LEAVE, BOT_ID, {})
+        self.assertFalse(any(isinstance(r, functions.contacts.BlockRequest) for r in self.client.requests))
+
+    async def test_bot_block_failure_does_not_hide_the_deletion(self):
+        await self.backend.load_dialogs()
+        self.client.fail_on = {functions.contacts.BlockRequest: errors.RPCError(request=None, message="SOMETHING", code=400)}
+        status, message = await self.backend.perform(LEAVE, BOT_ID, {"block_bots": True})
+        self.assertEqual(status, "removed")
+        self.assertIn("Blocking failed", message)
+
+    async def test_private_chats_and_unlisted_ids_never_reach_telegram(self):
+        await self.backend.load_dialogs()
+        for action in (LEAVE, ARCHIVE, MUTE):
+            for item_id in ("444", "42", "-1000000999999"):
+                with self.assertRaises(ActionFailed) as ctx:
+                    await self.backend.perform(action, item_id, {})
+                self.assertFalse(ctx.exception.retryable)
+        with self.assertRaises(ActionFailed):  # owned: can't leave
+            await self.backend.perform(LEAVE, OWNED, {})
+        with self.assertRaises(ActionFailed):  # already muted
+            await self.backend.perform(MUTE, OWNED, {})
         self.assertEqual(self.client.requests, [])
+
+    async def test_archive_and_mute_requests(self):
+        await self.backend.load_dialogs()
+        self.assertEqual(await self.backend.perform(ARCHIVE, OWNED, {}), ("archived", "Moved to Archive."))
+        self.assertEqual((await self.backend.perform(MUTE, CH, {}))[0], "muted")
+        archive, mute = self.client.requests
+        self.assertIsInstance(archive, functions.folders.EditPeerFoldersRequest)
+        self.assertEqual(archive.folder_peers[0].folder_id, 1)
+        self.assertEqual(archive.folder_peers[0].peer, types.InputPeerChannel(333, 1))
+        self.assertIsInstance(mute, functions.account.UpdateNotifySettingsRequest)
+        self.assertEqual(mute.settings.mute_until, MUTE_FOREVER)
+        self.assertTrue(self.backend.cached_item(OWNED).archived)
+        self.assertTrue(self.backend.cached_item(CH).muted)
+        with self.assertRaises(ActionFailed):  # duplicates are refused locally
+            await self.backend.perform(ARCHIVE, OWNED, {})
+        self.assertEqual(len(self.client.requests), 2)
 
     async def test_error_mapping(self):
         await self.backend.load_dialogs()
         cases = [
             (errors.FloodWaitError(request=None, capture=42), RateLimited, None),
             (errors.FloodPremiumWaitError(request=None, capture=7), RateLimited, None),
-            (errors.UserNotParticipantError(request=None), NotMember, None),
-            (errors.UserCreatorError(request=None), LeaveFailed, False),
-            (errors.ChannelPrivateError(request=None), LeaveFailed, False),
-            (errors.ChannelInvalidError(request=None), LeaveFailed, False),
-            (errors.RPCError(request=None, message="SOMETHING_NEW", code=400), LeaveFailed, True),
-            (ConnectionError("reset"), LeaveFailed, True),
-            (asyncio.TimeoutError(), LeaveFailed, True),
+            (errors.UserCreatorError(request=None), ActionFailed, False),
+            (errors.ChannelPrivateError(request=None), ActionFailed, False),
+            (errors.ChannelInvalidError(request=None), ActionFailed, False),
+            (errors.RPCError(request=None, message="SOMETHING_NEW", code=400), ActionFailed, True),
+            (ConnectionError("reset"), ActionFailed, True),
+            (asyncio.TimeoutError(), ActionFailed, True),
         ]
         for exc, expected, retryable in cases:
             self.client.raise_next = [exc]
             with self.assertRaises(expected, msg=repr(exc)) as ctx:
-                await self.backend.leave("-1000000000111")
+                await self.backend.perform(LEAVE, CH, {})
             if retryable is not None:
                 self.assertEqual(ctx.exception.retryable, retryable, repr(exc))
         self.client.raise_next = [errors.FloodWaitError(request=None, capture=42)]
         with self.assertRaises(RateLimited) as ctx:
-            await self.backend.leave("-1000000000111")
+            await self.backend.perform(LEAVE, CH, {})
         self.assertEqual(ctx.exception.seconds, 42)
+        self.client.raise_next = [errors.UserNotParticipantError(request=None)]
+        self.assertEqual((await self.backend.perform(LEAVE, CH, {}))[0], "not_member")
+
+    async def test_scan_reads_position_and_own_last_message_and_caches_it(self):
+        await self.backend.load_dialogs()
+        read_date, my_date = NOW - timedelta(days=200), NOW - timedelta(days=400)
+        # Channel (can't post): only the read position is looked up.
+        self.client.responses = [messages(read_date)]
+        await self.backend.scan(CH)
+        (history,) = self.client.requests
+        self.assertIsInstance(history, functions.messages.GetHistoryRequest)
+        self.assertEqual((history.offset_id, history.limit), (501, 1))
+        self.assertEqual(self.backend.cached_item(CH).last_read_at, read_date)
+
+        # Bot: read position + search for your own last message.
+        self.client.requests.clear()
+        self.client.responses = [messages(read_date), messages(my_date)]
+        status, _ = await self.backend.scan(BOT_ID)
+        self.assertEqual(status, "scanned")
+        search = self.client.requests[1]
+        self.assertIsInstance(search, functions.messages.SearchRequest)
+        self.assertIsInstance(search.from_id, types.InputPeerSelf)
+        self.assertEqual(search.limit, 1)
+        self.assertEqual(self.backend.cached_item(BOT_ID).my_last_message_at, my_date)
+
+        # Caught-up group where the newest message is yours: nothing to ask Telegram.
+        self.client.requests.clear()
+        await self.backend.scan(GR)
+        self.assertEqual(self.client.requests, [])
+
+        # The result survives a reload (same read position) ...
+        cache = json.loads((self.dir / "scan_cache.json").read_text())
+        self.assertIn(BOT_ID, cache)
+        await self.backend.load_dialogs()
+        self.assertEqual(self.backend.cached_item(BOT_ID).my_last_message_at, my_date)
+        self.assertIsNotNone(self.backend.cached_item(BOT_ID).scanned_at)
+        # ... but is dropped once you have read further (the dates could be stale).
+        self.client.dialogs[4] = dialog(user(555, bot=True), types.InputPeerUser(555, 1), read_max=900)
+        await self.backend.load_dialogs()
+        self.assertIsNone(self.backend.cached_item(BOT_ID).my_last_message_at)
+        self.assertIsNone(self.backend.cached_item(BOT_ID).scanned_at)
+
+    async def test_scan_with_no_messages_found(self):
+        await self.backend.load_dialogs()
+        self.client.responses = [messages(), messages()]
+        await self.backend.scan(BOT_ID)
+        item = self.backend.cached_item(BOT_ID)
+        self.assertIsNone(item.last_read_at)
+        self.assertIsNone(item.my_last_message_at)
+        self.assertIsNotNone(item.scanned_at)
+
+    async def test_scan_flood_wait_is_reported(self):
+        await self.backend.load_dialogs()
+        self.client.raise_next = [errors.FloodWaitError(request=None, capture=30)]
+        with self.assertRaises(RateLimited):
+            await self.backend.scan(CH)
 
     async def test_login_with_two_step_verification_never_logs_secrets(self):
         self.client.authorized = False
@@ -289,9 +435,10 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.exception.status, 429)
         self.assertIn("300", ctx.exception.message)
 
-    async def test_logout_deletes_local_session_even_if_telegram_is_unreachable(self):
+    async def test_logout_deletes_local_session_and_scan_cache_even_if_telegram_is_unreachable(self):
         session_file = self.dir / "telegram.session"
         session_file.write_text("x")
+        (self.dir / "scan_cache.json").write_text("{}")
 
         async def broken_logout():
             raise ConnectionError("offline")
@@ -300,10 +447,9 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         result = await self.backend.log_out()
         self.assertFalse(result["telegram_confirmed"])
         self.assertFalse(session_file.exists())
+        self.assertFalse((self.dir / "scan_cache.json").exists())
 
     async def test_status_never_blocks_on_a_stalled_connection(self):
-        from tgcleaner import telegram_backend
-
         stalled = FakeClient()
 
         async def hang():

@@ -30,7 +30,7 @@ def _ask(prompt: str, validate, secret: bool = False, default=None):
 def cmd_setup(args) -> int:
     base = data_dir()
     existing = load_config(base)
-    print("TG Group Cleaner setup")
+    print("TG Cleaner setup")
     print("Get an API ID and API hash at https://my.telegram.org -> API development tools.")
     print(f"They are stored only on this computer, in {config_path(base)}.\n")
     api_id = _ask("API ID", validate_api_id, default=existing.api_id if existing else None)
@@ -42,6 +42,7 @@ def cmd_setup(args) -> int:
                  extension_ids=[ext_id])
     if existing:
         cfg.leave_delay_seconds = existing.leave_delay_seconds
+        cfg.scan_delay_seconds = existing.scan_delay_seconds
         cfg.max_auto_flood_wait = existing.max_auto_flood_wait
     path = save_config(cfg, base)
     print(f"\nSaved {path}. Start the service and open the extension to log in.")
@@ -59,7 +60,7 @@ def cmd_serve(args) -> int:
         demo_cfg = Config(api_id=1, api_hash="0" * 32,
                           port=cfg.port if cfg else DEFAULT_PORT,
                           extension_ids=cfg.extension_ids if cfg else [DEFAULT_EXTENSION_ID],
-                          leave_delay_seconds=0.5, max_auto_flood_wait=60)
+                          leave_delay_seconds=0.5, scan_delay_seconds=0.3, max_auto_flood_wait=60)
         if args.port:
             demo_cfg.port = args.port
         run(demo_cfg, FakeBackend(random_failures=True), demo=True)

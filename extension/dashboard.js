@@ -1,12 +1,17 @@
 import { ApiError, api, currentPort, loadPort, savePort } from "./api.js";
 import {
-  KIND_LABELS, PRESET_THRESHOLDS, ROLE_LABELS, activityOf, daysSince, formatAgo, formatDate, inactiveIds,
-  matchesFilters, parseThreshold, pruneSelection, retryableIds, selectableIds, sortItems, summarize,
+  ACTIONS, KIND_LABELS, PRESET_THRESHOLDS, ROLE_LABELS, activityOf, daysSince, eligible, engagementIso,
+  estimateSeconds, formatAgo, formatDate, formatDuration, inactiveIds, ineligibility, matchesFilters, needsScan,
+  parseThreshold, pruneSelection, retryableIds, selectableIds, sortItems, summarize,
 } from "./logic.js";
 
 const $ = (id) => document.getElementById(id);
 
-const DEFAULT_PREFS = { threshold: 90, thresholdChoice: "90", show: "all", kind: "all", sort: "oldest" };
+const DEFAULT_PREFS = {
+  threshold: 90, thresholdChoice: "90", show: "all", kind: "all", sort: "oldest",
+  basis: "chat", action: "leave", muted: "any", unreadOnly: false,
+};
+const SCAN_SECONDS_PER_ITEM = 1.6; // pause + up to two small requests
 
 const state = {
   status: null,
@@ -23,7 +28,7 @@ const state = {
   job: null,
   jobResults: new Map(),
   dismissedJob: null,
-  pending: null, // prepared leave awaiting confirmation
+  pending: null, // prepared action awaiting confirmation
 };
 
 const rows = new Map(); // item id -> row element
@@ -41,7 +46,6 @@ function el(tag, props = {}, ...children) {
     if (k === "class") node.className = v;
     else if (k === "text") node.textContent = v;
     else if (k === "dataset") Object.assign(node.dataset, v);
-    else if (k in node && typeof v !== "string") node[k] = v;
     else node.setAttribute(k, v);
   }
   for (const c of children) if (c !== null && c !== undefined && c !== false) node.append(c);
@@ -76,6 +80,8 @@ function plural(n, one, many = `${one}s`) {
 }
 
 const jobActive = () => Boolean(state.job && ["running", "waiting"].includes(state.job.state));
+const action = () => state.prefs.action;
+const actionWord = (act) => ACTIONS[act].label.toLowerCase();
 
 // ---------------------------------------------------------------------------
 // preferences (harmless UI settings only)
@@ -89,6 +95,7 @@ async function loadPrefs() {
     // defaults
   }
   state.prefs.threshold = parseThreshold(state.prefs.threshold) ?? DEFAULT_PREFS.threshold;
+  if (!["leave", "archive", "mute"].includes(state.prefs.action)) state.prefs.action = "leave";
 }
 
 function savePrefs() {
@@ -104,6 +111,10 @@ function applyPrefsToControls() {
   $("showSelect").value = p.show;
   $("kindSelect").value = p.kind;
   $("sortSelect").value = p.sort;
+  $("basisSelect").value = p.basis;
+  $("actionSelect").value = p.action;
+  $("mutedSelect").value = p.muted;
+  $("unreadOnly").checked = Boolean(p.unreadOnly);
 }
 
 // ---------------------------------------------------------------------------
@@ -257,23 +268,26 @@ async function disconnect() {
 }
 
 // ---------------------------------------------------------------------------
-// dialog list
+// item list
 // ---------------------------------------------------------------------------
 
-async function loadDialogs() {
+/** cached=true re-reads the service's copy (after a job) instead of downloading the list from Telegram again. */
+async function loadDialogs({ cached = false } = {}) {
   if (state.loading) return;
   state.loading = true;
-  $("loadingState").hidden = false;
-  $("emptyState").hidden = true;
+  if (!cached) {
+    $("loadingState").hidden = false;
+    $("emptyState").hidden = true;
+  }
   $("reloadBtn").disabled = true;
   try {
-    const data = await api("/api/dialogs");
+    const data = await api(cached ? "/api/dialogs?cached=1" : "/api/dialogs");
     state.items = data.items;
     state.byId = new Map(data.items.map((it) => [it.id, it]));
     state.excluded = data.excluded;
     state.loaded = true;
     rows.clear();
-    state.selection = pruneSelection(state.selection, state.items);
+    state.selection = pruneSelection(state.selection, state.items, action());
     state.lastClicked = null;
   } catch (e) {
     toast(errorText(e), 7000);
@@ -286,10 +300,18 @@ async function loadDialogs() {
   render();
 }
 
+function filters() {
+  const p = state.prefs;
+  return {
+    query: state.query, show: p.show, kind: p.kind, threshold: p.threshold, basis: p.basis,
+    action: p.action, muted: p.muted, unreadOnly: p.unreadOnly,
+  };
+}
+
 function computeVisible() {
   const now = Date.now();
-  const filters = { query: state.query, show: state.prefs.show, kind: state.prefs.kind, threshold: state.prefs.threshold };
-  state.visible = sortItems(state.items.filter((it) => matchesFilters(it, filters, now)), state.prefs.sort);
+  const f = filters();
+  state.visible = sortItems(state.items.filter((it) => matchesFilters(it, f, now)), state.prefs.sort, state.prefs.basis);
 }
 
 function render() {
@@ -300,21 +322,39 @@ function render() {
 }
 
 function renderStats() {
-  const s = summarize(state.items, state.prefs.threshold, Date.now());
+  const p = state.prefs;
+  const s = summarize(state.items, p.threshold, Date.now(), p.basis, p.action);
   $("statTotal").textContent = state.loaded ? s.total : "–";
   $("statInactive").textContent = state.loaded ? s.inactive : "–";
-  $("statInactiveLabel").textContent = `Inactive ${state.prefs.threshold}+ days`;
+  $("statInactiveLabel").textContent = p.basis === "you"
+    ? `Not read or posted ${p.threshold}+ days`
+    : `No messages ${p.threshold}+ days`;
   $("statUnknown").textContent = state.loaded ? s.unknown : "–";
   $("statSelected").textContent = state.selection.size;
-  $("selectInactiveBtn").textContent = "Select inactive";
-  $("selectInactiveBtn").title =
-    `Select every shown item whose last message is ${state.prefs.threshold}+ days old. Items with unknown activity are never included.`;
+  $("selectInactiveBtn").title = p.basis === "you"
+    ? `Select every shown item you haven't read or posted in for ${p.threshold}+ days. Unknown activity is never included.`
+    : `Select every shown item whose last message is ${p.threshold}+ days old. Unknown activity is never included.`;
+  $("unavailableOption").textContent = `Can't ${actionWord(p.action)}`;
 
   const ex = state.excluded;
   $("excludedNote").textContent = ex
-    ? `Never shown or touched: ${plural(ex.private_chat ?? 0, "private chat")}, ${plural(ex.bot ?? 0, "bot")}` +
-      `${ex.saved_messages ? " and Saved Messages" : ""}. ${s.unavailable} listed item${s.unavailable === 1 ? "" : "s"} can't be left (reason shown on each).`
+    ? `${s.bots ? `Includes ${plural(s.bots, "bot")}. ` : ""}Never shown or touched: ${plural(ex.private_chat ?? 0, "private chat")} with people` +
+      `${ex.saved_messages ? " and Saved Messages" : ""}. ${s.unavailable} listed item${s.unavailable === 1 ? "" : "s"} can't be ` +
+      `${p.action === "leave" ? "left or removed" : `${p.action}d`} (reason shown on each).`
     : "";
+  renderScanBanner(s.needsScan);
+}
+
+function renderScanBanner(needing) {
+  const show = state.loaded && state.prefs.basis === "you" && needing > 0 && !jobActive();
+  $("scanBanner").hidden = !show;
+  $("scanBtn").disabled = jobActive() || !state.loaded;
+  if (!show) return;
+  const eta = formatDuration(estimateSeconds(needing, SCAN_SECONDS_PER_ITEM));
+  $("scanBannerTitle").textContent = `Scan your activity in ${plural(needing, "chat")}`;
+  $("scanBannerText").textContent =
+    "For these, the chat list alone doesn't tell when you last read or posted, so busy chats you never open can't be " +
+    `found yet. The scan is read-only (it changes nothing), takes about ${eta}, and is remembered on your computer.`;
 }
 
 function renderList() {
@@ -341,60 +381,93 @@ function makeRow(item) {
   if (item.link && item.link.startsWith("https://t.me/")) {
     sub.append(el("a", { href: item.link, target: "_blank", rel: "noopener noreferrer", text: `@${item.username}` }));
   }
-  if (item.archived) sub.append(el("span", { class: "tag", text: "Archived" }));
+  const role = ROLE_LABELS[item.role];
+  if (item.role === "owner" || item.role === "admin") sub.append(el("span", { class: "tag", text: role }));
+  sub.append(el("span", { class: "tag tag-archived", text: "Archived" }), el("span", { class: "tag tag-muted", text: "Muted" }));
   if (item.participants_count) sub.append(el("span", { text: `${item.participants_count.toLocaleString()} members` }));
-  if (item.unread_count) sub.append(el("span", { text: `${item.unread_count.toLocaleString()} unread` }));
+  if (item.unread_count) sub.append(el("span", { class: "unread", text: `${item.unread_count.toLocaleString()} unread` }));
 
   return el("div", { class: "item", dataset: { id: item.id }, role: "row" },
     el("div", { class: "cb" }, checkbox),
     el("div", { class: "title-cell" }, el("div", { class: "title", text: item.title, title: item.title }), sub),
     el("div", { class: "kind", text: KIND_LABELS[item.kind] ?? item.kind }),
-    el("div", { class: "role", text: ROLE_LABELS[item.role] ?? item.role }),
-    el("div", { class: "when" }, el("span", { class: "ago" }), el("span", { class: "date muted" })),
+    el("div", { class: "when chat-when" }, el("span", { class: "ago" }), el("span", { class: "date muted" })),
+    el("div", { class: "when you-when" }, el("span", { class: "ago" }), el("span", { class: "date muted" })),
     el("div", { class: "status-cell" }),
   );
 }
 
 const RESULT_LABELS = {
   pending: ["Queued", "info"],
-  in_progress: ["Leaving…", "info spin"],
+  in_progress: ["Working…", "info spin"],
   left: ["Left ✓", "ok"],
+  removed: ["Deleted ✓", "ok"],
   not_member: ["Not a member", "ok"],
+  archived: ["Archived ✓", "ok"],
+  muted: ["Muted ✓", "ok"],
+  scanned: ["Scanned", "ok"],
   failed: ["Failed", "bad"],
   rate_limited: ["Rate limited", "warn"],
   cancelled: ["Not attempted", "muted"],
 };
 
+/** Second line of the "You" column: what we know about your reading and posting. */
+function youDetail(item, now) {
+  const read = item.last_read_at ? `read ${formatAgo(daysSince(item.last_read_at, now)).toLowerCase()}` : null;
+  let posted = null;
+  if (item.can_post) {
+    if (item.my_last_message_at) posted = `posted ${formatAgo(daysSince(item.my_last_message_at, now)).toLowerCase()}`;
+    else if (item.scanned_at) posted = "never posted";
+  }
+  const parts = [read, posted].filter(Boolean);
+  if (parts.length) return parts.join(" · ");
+  if (item.scanned_at) return item.unread_count ? "never read" : "no record";
+  return needsScan(item) ? "not scanned yet" : "—";
+}
+
 function updateRow(row, item, now) {
+  const p = state.prefs;
   const selected = state.selection.has(item.id);
-  const disabled = !item.leavable || jobActive();
+  const ok = eligible(item, p.action);
   row.classList.toggle("selected", selected);
-  row.classList.toggle("disabled", !item.leavable);
+  row.classList.toggle("disabled", !ok);
+  row.classList.toggle("is-archived", Boolean(item.archived));
+  row.classList.toggle("is-muted", Boolean(item.muted));
   const cb = row.querySelector("input");
   cb.checked = selected;
-  cb.disabled = disabled;
+  cb.disabled = !ok || jobActive();
 
-  const activity = activityOf(item, state.prefs.threshold, now);
-  const ago = row.querySelector(".ago");
-  ago.textContent = formatAgo(daysSince(item.last_message_at, now));
-  ago.className = `ago ${activity}`;
-  ago.title = activity === "unknown"
+  // "Last message" column: activity of the chat itself.
+  const chatActivity = activityOf(item, p.threshold, now, "chat");
+  const chat = row.querySelector(".chat-when .ago");
+  chat.textContent = formatAgo(daysSince(item.last_message_at, now));
+  chat.className = `ago ${p.basis === "chat" ? chatActivity : "plain"}`;
+  chat.title = chatActivity === "unknown"
     ? "Telegram returned no message history, so activity is unknown (not assumed inactive)."
-    : `Last known message: ${new Date(item.last_message_at).toLocaleString()}`;
-  row.querySelector(".date").textContent = item.last_message_at ? formatDate(item.last_message_at) : "No history available";
+    : `Newest message: ${new Date(item.last_message_at).toLocaleString()}`;
+  row.querySelector(".chat-when .date").textContent = item.last_message_at ? formatDate(item.last_message_at) : "No history available";
+
+  // "You" column: your own engagement.
+  const youActivity = activityOf(item, p.threshold, now, "you");
+  const you = row.querySelector(".you-when .ago");
+  you.textContent = formatAgo(daysSince(engagementIso(item), now));
+  you.className = `ago ${p.basis === "you" ? youActivity : "plain"}`;
+  you.title = "When you last read here (date of the newest message you've read) or posted here.";
+  row.querySelector(".you-when .date").textContent = youDetail(item, now);
 
   const cell = row.querySelector(".status-cell");
   const result = state.jobResults.get(item.id);
-  if (result) {
+  const reason = ineligibility(item, p.action);
+  if (result && result.status !== "scanned") {
     const [label, cls] = RESULT_LABELS[result.status] ?? [result.status, "muted"];
     cell.replaceChildren(el("span", { class: `pill ${cls}`, text: label, title: result.message ?? "" }));
-    if (result.message && !["left", "pending", "in_progress"].includes(result.status)) {
+    if (result.message && !["left", "pending", "in_progress", "archived", "muted"].includes(result.status)) {
       cell.append(el("div", { class: "reason", text: result.message, title: result.message }));
     }
-  } else if (!item.leavable) {
+  } else if (reason) {
     cell.replaceChildren(
-      el("span", { class: "pill muted", text: "Can't leave here" }),
-      el("div", { class: "reason", text: item.reason ?? "", title: item.reason ?? "" }),
+      el("span", { class: "pill muted", text: `Can't ${actionWord(p.action)}` }),
+      el("div", { class: "reason", text: reason, title: reason }),
     );
   } else {
     cell.replaceChildren();
@@ -418,10 +491,12 @@ function renderActionBar() {
   $("selectionSummary").textContent = n === 0
     ? "Nothing selected"
     : `${plural(n, "item")} selected${hidden > 0 ? ` (${hidden} hidden by filters)` : ""}`;
-  $("leaveBtn").disabled = n === 0 || jobActive();
-  $("leaveBtn").textContent = n ? `Leave selected (${n})` : "Leave selected";
+  const btn = $("applyBtn");
+  btn.disabled = n === 0 || jobActive();
+  btn.textContent = `${ACTIONS[action()].verb} selected${n ? ` (${n})` : ""}`;
+  btn.className = `btn ${action() === "leave" ? "btn-danger" : "btn-primary"}`;
   const lock = jobActive();
-  for (const id of ["selectInactiveBtn", "selectAllBtn", "deselectAllBtn", "reloadBtn"]) $(id).disabled = lock;
+  for (const id of ["selectInactiveBtn", "selectAllBtn", "deselectAllBtn", "reloadBtn", "actionSelect"]) $(id).disabled = lock;
 }
 
 function setSelected(ids, value) {
@@ -437,14 +512,14 @@ function onListClick(event) {
   const row = event.target.closest(".item");
   if (!row || jobActive()) return;
   const item = state.byId.get(row.dataset.id);
-  if (!item || !item.leavable) return;
+  if (!item || !eligible(item, action())) return;
   const index = state.visible.indexOf(item);
   const value = !state.selection.has(item.id);
   if (event.shiftKey && state.lastClicked !== null) {
     // Shift+click selects/deselects the whole range in the current view.
     const from = Math.min(state.lastClicked, index);
     const to = Math.max(state.lastClicked, index);
-    setSelected(selectableIds(state.visible.slice(from, to + 1)), value);
+    setSelected(selectableIds(state.visible.slice(from, to + 1), action()), value);
   } else {
     setSelected([item.id], value);
   }
@@ -453,52 +528,94 @@ function onListClick(event) {
 }
 
 // ---------------------------------------------------------------------------
-// leave: prepare -> confirm -> start
+// actions: prepare -> confirm -> start
 // ---------------------------------------------------------------------------
 
-async function prepareAndConfirm(ids, button) {
+const CONFIRM_TEXT = {
+  leave: {
+    title: (n) => `Leave or remove ${plural(n, "chat")}?`,
+    intro: "You will leave these groups and channels and delete these bot chats, one at a time. Nothing has happened yet.",
+    note: "Leaving can't be undone here: to rejoin a private group or channel you need a new invite link. " +
+      "Bot chats are deleted on your side only.",
+    ok: (n) => `Leave / remove ${n}`,
+  },
+  archive: {
+    title: (n) => `Archive ${plural(n, "chat")}?`,
+    intro: "These move to Telegram's Archive folder. You stay a member. Nothing has happened yet.",
+    note: "Unarchive any time in Telegram. Archived chats that aren't muted return to the main list when a new message arrives.",
+    ok: (n) => `Archive ${n}`,
+  },
+  mute: {
+    title: (n) => `Mute ${plural(n, "chat")}?`,
+    intro: "Notifications for these are turned off forever. You stay a member. Nothing has happened yet.",
+    note: "Unmute any time in Telegram.",
+    ok: (n) => `Mute ${n}`,
+  },
+};
+
+async function prepareAndConfirm(act, ids, button) {
   let prepared;
   try {
-    prepared = await withBusy(button, () => api("/api/leave/prepare", { method: "POST", body: { ids } }));
+    prepared = await withBusy(button, () => api("/api/actions/prepare", { method: "POST", body: { action: act, ids } }));
   } catch (e) {
     toast(errorText(e), 7000);
     return;
   }
   state.pending = prepared;
+  const text = CONFIRM_TEXT[act];
   const n = prepared.items.length;
-  $("confirmTitle").textContent = n ? `Leave ${plural(n, "group or channel", "groups and channels")}?` : "Nothing to leave";
-  $("confirmIntro").textContent = n
-    ? "You will leave exactly these, one at a time. Nothing has been left yet."
-    : "None of the selected items can be left.";
+  const bots = prepared.items.filter((it) => it.kind === "bot").length;
+  $("confirmTitle").textContent = n ? text.title(n) : "Nothing to do";
+  $("confirmIntro").textContent = n ? text.intro : "None of the selected items qualify for this action.";
   $("confirmList").replaceChildren(...prepared.items.map((it) =>
     el("li", {}, el("span", { text: it.title }), el("span", { class: "k", text: KIND_LABELS[it.kind] ?? it.kind }))));
   $("confirmList").hidden = n === 0;
   $("confirmRejectedWrap").hidden = prepared.rejected.length === 0;
   $("confirmRejected").replaceChildren(...prepared.rejected.map((r) =>
-    el("li", {}, el("strong", { text: r.title ?? r.id }), el("span", { class: "k", text: ` — ${r.reason ?? "not leavable"}` }))));
+    el("li", {}, el("strong", { text: r.title ?? r.id }), el("span", { class: "k", text: ` — ${r.reason ?? "not eligible"}` }))));
+  $("blockBotsWrap").hidden = !(act === "leave" && bots > 0);
+  $("blockBots").checked = false;
+  $("blockBotsLabel").textContent = `Also block ${bots === 1 ? "this bot" : `these ${bots} bots`} (they can't message you again)`;
+  $("confirmNote").textContent = n ? text.note : "";
   $("confirmOk").hidden = n === 0;
   $("confirmOk").disabled = false;
-  $("confirmOk").textContent = `Leave ${n}`;
+  $("confirmOk").textContent = text.ok(n);
+  $("confirmOk").className = `btn ${act === "leave" ? "btn-danger" : "btn-primary"}`;
   $("confirmError").textContent = "";
   $("confirmDialog").showModal();
 }
 
-async function confirmLeave(event) {
+async function confirmAction(event) {
   event.preventDefault();
   const pending = state.pending;
   if (!pending?.token) return;
   const button = $("confirmOk");
   button.disabled = true; // a second click can't start anything: the token is single-use anyway
   try {
-    const job = await api("/api/leave/start", { method: "POST", body: { token: pending.token } });
+    const options = { block_bots: !$("blockBotsWrap").hidden && $("blockBots").checked };
+    const job = await api("/api/actions/start", { method: "POST", body: { token: pending.token, options } });
     state.pending = null;
     $("confirmDialog").close("started");
     for (const it of pending.items) state.selection.delete(it.id);
-    setJob(job);
-    pollJob();
+    startedJob(job);
   } catch (e) {
     $("confirmError").textContent = errorText(e);
   }
+}
+
+async function startScan(ids, button) {
+  try {
+    const job = await withBusy(button, () => api("/api/scan/start", { method: "POST", body: ids ? { ids } : {} }));
+    startedJob(job);
+  } catch (e) {
+    toast(errorText(e), 7000);
+  }
+}
+
+function startedJob(job) {
+  state.dismissedJob = null;
+  setJob(job);
+  pollJob();
 }
 
 // ---------------------------------------------------------------------------
@@ -507,7 +624,7 @@ async function confirmLeave(event) {
 
 async function refreshJob() {
   try {
-    const { job } = await api("/api/leave/job");
+    const { job } = await api("/api/job");
     if (job) setJob(job);
     if (jobActive()) pollJob();
   } catch {
@@ -516,32 +633,17 @@ async function refreshJob() {
 }
 
 function setJob(job) {
-  const wasActive = jobActive();
   state.job = job;
   state.jobResults = new Map(job.items.map((it) => [it.id, it]));
-  if (!jobActive()) {
-    // Telegram-confirmed results make items unleavable locally, so they can't be selected again.
-    for (const r of job.items) {
-      const item = state.byId.get(r.id);
-      if (item && (r.status === "left" || r.status === "not_member")) {
-        item.leavable = false;
-        item.reason = r.status === "left" ? "You left this." : "You already left this.";
-      }
-    }
-    state.selection = pruneSelection(state.selection, state.items);
-  }
   renderProgress();
-  if (state.loaded) {
-    refreshRows();
-    if (wasActive && !jobActive()) render();
-  }
+  if (state.loaded) refreshRows();
 }
 
 function pollJob() {
   clearTimeout(jobTimer);
   jobTimer = setTimeout(async () => {
     try {
-      const { job } = await api("/api/leave/job");
+      const { job } = await api("/api/job");
       if (job) setJob(job);
     } catch (e) {
       $("progressSub").textContent = `${errorText(e)} Still trying…`;
@@ -551,9 +653,16 @@ function pollJob() {
   }, 1000);
 }
 
-function onJobFinished() {
-  const c = state.job.counts;
-  toast(`Finished: ${c.left ?? 0} left, ${c.failed ?? 0} failed.`, 6000);
+async function onJobFinished() {
+  const job = state.job;
+  const c = job.counts;
+  const done = Object.entries(c)
+    .filter(([k]) => !["failed", "rate_limited", "cancelled"].includes(k))
+    .reduce((sum, [, v]) => sum + v, 0);
+  toast(`${ACTIONS[job.kind]?.label ?? "Job"} finished: ${done} done, ${c.failed ?? 0} failed.`, 6000);
+  // Pick up what changed (left, archived, muted, scan results) from the service's copy of the list.
+  await loadDialogs({ cached: true });
+  renderProgress();
 }
 
 function countChip(count, label, cls) {
@@ -572,6 +681,7 @@ function renderProgress() {
   panel.hidden = false;
   const c = job.counts;
   const active = jobActive();
+  const meta = ACTIONS[job.kind] ?? ACTIONS.leave;
   const problems = (c.failed ?? 0) + (c.rate_limited ?? 0) + (c.cancelled ?? 0);
   panel.classList.toggle("done", !active && problems === 0);
   panel.classList.toggle("problem", !active && problems > 0);
@@ -579,10 +689,10 @@ function renderProgress() {
   let title;
   let sub = "";
   if (job.state === "running") {
-    title = `Leaving… ${job.processed} of ${job.total}`;
+    title = `${meta.progress}… ${job.processed} of ${job.total}`;
     sub = job.cancel_requested
       ? "Cancelling: stopping after the current item."
-      : "Items are left one at a time with a short pause between them. You can close this tab; the service keeps going.";
+      : "One item at a time with a short pause between them. You can close this tab; the service keeps going.";
   } else if (job.state === "waiting") {
     const secs = Math.max(0, Math.ceil(job.wait_until - Date.now() / 1000));
     title = `Paused by Telegram rate limit (${job.processed} of ${job.total} done)`;
@@ -592,18 +702,24 @@ function renderProgress() {
     const at = job.retry_after ? new Date(job.retry_after * 1000).toLocaleTimeString() : "later";
     sub = `Telegram asked for a long pause, so the rest were not attempted. You can retry them after ${at}.`;
   } else if (job.state === "cancelled") {
-    title = "Cancelled";
+    title = `${meta.label} cancelled`;
     sub = "Items not yet attempted were left untouched.";
   } else {
-    title = problems ? "Finished with some problems" : "Finished";
-    sub = "Every status below is Telegram's actual answer. Use Reload list to refresh the list from Telegram.";
+    title = `${meta.label}: ${problems ? "finished with some problems" : "finished"}`;
+    sub = job.kind === "scan"
+      ? "Set “Inactive means” to “You haven't read or posted” to find chats you ignore."
+      : "Every status below is Telegram's actual answer.";
   }
   $("progressTitle").textContent = title;
   $("progressSub").textContent = sub;
   $("progressBar").style.width = `${job.total ? (100 * job.processed) / job.total : 0}%`;
   $("progressCounts").replaceChildren(...[
     countChip(c.left, "Left", "ok"),
+    countChip(c.removed, "Bot chats deleted", "ok"),
     countChip(c.not_member, "Already not a member", "ok"),
+    countChip(c.archived, "Archived", "ok"),
+    countChip(c.muted, "Muted", "ok"),
+    countChip(c.scanned, "Scanned", "ok"),
     countChip(c.failed, "Failed", "bad"),
     countChip(c.rate_limited, "Rate limited", "warn"),
     countChip(c.cancelled, "Not attempted", "muted"),
@@ -627,7 +743,7 @@ function renderProgress() {
       return el("li", {},
         el("span", { class: `pill ${cls}`, text: label }), " ",
         el("span", { text: it.title }),
-        it.message && it.status !== "left" ? el("span", { class: "msg", text: it.message }) : null);
+        it.message && !["left", "archived", "muted"].includes(it.status) ? el("span", { class: "msg", text: it.message }) : null);
     }));
   }
 }
@@ -642,6 +758,11 @@ function debounce(fn, ms) {
     clearTimeout(t);
     t = setTimeout(() => fn(...args), ms);
   };
+}
+
+function setPref(key, value) {
+  state.prefs[key] = value;
+  savePrefs();
 }
 
 function bind() {
@@ -671,60 +792,79 @@ function bind() {
   }, 120));
   $("thresholdSelect").addEventListener("change", (e) => {
     const v = e.target.value;
-    state.prefs.thresholdChoice = v;
+    setPref("thresholdChoice", v);
     $("customField").hidden = v !== "custom";
     if (v === "custom") {
       $("customDays").focus();
     } else {
-      state.prefs.threshold = Number(v);
+      setPref("threshold", Number(v));
       $("customDays").value = v;
     }
-    savePrefs();
     render();
   });
   $("customDays").addEventListener("input", debounce((e) => {
     const n = parseThreshold(e.target.value);
     if (n === null) return;
-    state.prefs.threshold = n;
-    savePrefs();
+    setPref("threshold", n);
     render();
   }, 250));
-  for (const [id, key] of [["showSelect", "show"], ["kindSelect", "kind"], ["sortSelect", "sort"]]) {
+  for (const [id, key] of [["showSelect", "show"], ["kindSelect", "kind"], ["sortSelect", "sort"],
+    ["basisSelect", "basis"], ["mutedSelect", "muted"]]) {
     $(id).addEventListener("change", (e) => {
-      state.prefs[key] = e.target.value;
-      savePrefs();
+      setPref(key, e.target.value);
       render();
     });
   }
+  $("unreadOnly").addEventListener("change", (e) => {
+    setPref("unreadOnly", e.target.checked);
+    render();
+  });
+  $("actionSelect").addEventListener("change", (e) => {
+    setPref("action", e.target.value);
+    const before = state.selection.size;
+    state.selection = pruneSelection(state.selection, state.items, action());
+    const dropped = before - state.selection.size;
+    if (dropped) {
+      toast(`${plural(dropped, "selected item")} can't be ${actionWord(action())}d, so ${dropped === 1 ? "it was" : "they were"} deselected.`);
+    }
+    render();
+  });
 
   $("selectInactiveBtn").addEventListener("click", () => {
-    const ids = inactiveIds(state.visible, state.prefs.threshold, Date.now());
+    const p = state.prefs;
+    const ids = inactiveIds(state.visible, p.threshold, Date.now(), p.basis, p.action);
     setSelected(ids, true);
-    toast(ids.length ? `Selected ${plural(ids.length, "inactive item")}.` : "No leavable inactive items in this view.");
+    toast(ids.length ? `Selected ${plural(ids.length, "inactive item")}.` : "No eligible inactive items in this view.");
   });
-  $("selectAllBtn").addEventListener("click", () => setSelected(selectableIds(state.visible), true));
+  $("selectAllBtn").addEventListener("click", () => setSelected(selectableIds(state.visible, action()), true));
   $("deselectAllBtn").addEventListener("click", () => {
     state.selection.clear();
     refreshRows();
   });
-  $("reloadBtn").addEventListener("click", loadDialogs);
+  $("reloadBtn").addEventListener("click", () => loadDialogs());
+  $("scanBtn").addEventListener("click", (e) => startScan(null, e.currentTarget));
+  $("scanBannerBtn").addEventListener("click", (e) => startScan(null, e.currentTarget));
   $("list").addEventListener("click", onListClick);
 
-  $("leaveBtn").addEventListener("click", (e) => prepareAndConfirm([...state.selection], e.currentTarget));
-  $("confirmOk").addEventListener("click", confirmLeave);
+  $("applyBtn").addEventListener("click", (e) => prepareAndConfirm(action(), [...state.selection], e.currentTarget));
+  $("confirmOk").addEventListener("click", confirmAction);
   $("confirmDialog").addEventListener("close", () => {
     if ($("confirmDialog").returnValue !== "started") state.pending = null;
   });
 
   $("cancelJobBtn").addEventListener("click", async (e) => {
     try {
-      const job = await withBusy(e.currentTarget, () => api("/api/leave/cancel", { method: "POST", body: {} }));
+      const job = await withBusy(e.currentTarget, () => api("/api/job/cancel", { method: "POST", body: {} }));
       setJob(job);
     } catch (err) {
       toast(errorText(err));
     }
   });
-  $("retryBtn").addEventListener("click", (e) => prepareAndConfirm(retryableIds(state.job), e.currentTarget));
+  $("retryBtn").addEventListener("click", (e) => {
+    const job = state.job;
+    if (job.kind === "scan") startScan(retryableIds(job), e.currentTarget);
+    else prepareAndConfirm(job.kind, retryableIds(job), e.currentTarget);
+  });
   $("dismissJobBtn").addEventListener("click", () => {
     state.dismissedJob = state.job?.id ?? null;
     state.jobResults.clear();

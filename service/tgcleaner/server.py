@@ -8,9 +8,10 @@ Security model:
     forge Origin, and a custom header forces a CORS preflight that we refuse for
     any other origin, so other websites can neither read nor trigger anything.
   * Request bodies are small, JSON only, and strictly validated.
-  * Leaving is two-step: /prepare validates the selection and returns the exact
-    names plus a single-use token; /start consumes that token. Only one leave
-    job can run at a time.
+  * Actions (leave/remove, archive, mute) are two-step: /prepare validates the
+    selection and returns the exact names plus a single-use token; /start consumes
+    that token. The read-only engagement scan needs no token. Only one job (of any
+    kind) runs at a time, which also keeps the request rate low.
   * Request bodies are never logged (they may contain login codes or passwords).
 """
 
@@ -27,8 +28,8 @@ from dataclasses import dataclass
 from aiohttp import web
 
 from .config import Config
-from .leave_job import DONE_STATUSES, ItemResult, LeaveJob
-from .models import Backend, ServiceError, iso
+from .jobs import BatchJob, ItemResult
+from .models import ACTIONS, Backend, ServiceError, ineligibility, iso
 
 log = logging.getLogger("tgcleaner.server")
 
@@ -46,6 +47,7 @@ STATE = web.AppKey("state", object)
 
 @dataclass
 class Prepared:
+    action: str
     ids: list[str]
     expires: float
 
@@ -55,10 +57,11 @@ class State:
         self.cfg = cfg
         self.demo = demo
         self.prepared: dict[str, Prepared] = {}
-        self.job: LeaveJob | None = None
+        self.job: BatchJob | None = None
         self.job_task: asyncio.Task | None = None
         self.dialogs_loaded = False
         self.last_list = None
+        self.retry_after: dict[str, float] = {}  # job kind -> time Telegram allows that kind again
         self.start_lock = asyncio.Lock()
 
 
@@ -89,7 +92,7 @@ def make_security_middleware(cfg: Config):
         if origin not in allowed_origins:
             log.warning("rejected request from origin %r to %s", origin, request.path)
             return _error(403, "origin_not_allowed",
-                          "Only the TG Group Cleaner extension may use this service.")
+                          "Only the TG Cleaner extension may use this service.")
         if request.method == "OPTIONS":
             method = request.headers.get("Access-Control-Request-Method", "")
             if method not in ("GET", "POST"):
@@ -181,7 +184,7 @@ async def login_cancel(request):
 async def logout(request):
     st = _state(request)
     if st.job and st.job.active:
-        raise ServiceError("job_active", "Wait for the leave job to finish (or cancel it) before disconnecting.", 409)
+        raise ServiceError("job_active", "Wait for the running job to finish (or cancel it) before disconnecting.", 409)
     result = await _backend(request).log_out()
     st.prepared.clear()
     st.job = None
@@ -192,10 +195,11 @@ async def logout(request):
 
 async def dialogs(request):
     st = _state(request)
-    if st.job and st.job.active:
-        # Don't refetch mid-job; hand back the list the job works from (it reflects confirmed leaves).
+    want_cached = request.query.get("cached") == "1"
+    if (st.job and st.job.active) or (want_cached and st.last_list is not None):
+        # No refetch mid-job (or when asked): hand back the list the jobs work on; it reflects their results.
         if st.last_list is None:
-            raise ServiceError("job_active", "The list can't be reloaded while leaving is in progress.", 409)
+            raise ServiceError("job_active", "The list can't be reloaded while a job is running.", 409)
         result, cached = st.last_list, True
     else:
         result, cached = await _backend(request).load_dialogs(), False
@@ -225,25 +229,49 @@ def _validate_ids(raw) -> list[str]:
     return ids
 
 
-async def leave_prepare(request):
-    st = _state(request)
-    backend = _backend(request)
-    ids = _validate_ids((await _json_body(request)).get("ids"))
+def _check_can_start(st: State, kind: str) -> None:
     if st.job and st.job.active:
-        raise ServiceError("job_active", "A leave job is already running.", 409)
-    if st.job and st.job.retry_after and st.job.retry_after > time.time():
-        wait = int(st.job.retry_after - time.time()) + 1
-        raise ServiceError("rate_limited", f"Telegram asked to pause leaving. Try again in {wait} s.", 429)
+        raise ServiceError("job_active", "Another job is running. Wait for it or cancel it.", 409)
+    until = st.retry_after.get(kind, 0)
+    if until > time.time():
+        wait = int(until - time.time()) + 1
+        raise ServiceError("rate_limited", f"Telegram asked to pause this. Try again in {wait} s.", 429)
     if not st.dialogs_loaded:
         raise ServiceError("no_list", "Load the list first.", 409)
+
+
+def _launch(st: State, kind: str, items, operation) -> BatchJob:
+    delay = st.cfg.scan_delay_seconds if kind == "scan" else st.cfg.leave_delay_seconds
+    job = BatchJob(kind=kind, items=[ItemResult(id=it.id, title=it.title, kind=it.kind) for it in items],
+                   delay=delay, max_auto_wait=st.cfg.max_auto_flood_wait)
+    st.job = job
+
+    async def run():
+        await job.run(operation)
+        if job.retry_after:
+            st.retry_after[kind] = job.retry_after
+
+    st.job_task = asyncio.create_task(run())
+    log.info("%s job %s started with %d items", kind, job.id, len(items))
+    return job
+
+
+async def actions_prepare(request):
+    st = _state(request)
+    backend = _backend(request)
+    body = await _json_body(request)
+    action = body.get("action")
+    if action not in ACTIONS:
+        raise ServiceError("bad_request", f"'action' must be one of: {', '.join(ACTIONS)}.")
+    ids = _validate_ids(body.get("ids"))
+    _check_can_start(st, action)
 
     accepted, rejected = [], []
     for item_id in ids:
         item = backend.cached_item(item_id)
-        if item is None:
-            rejected.append({"id": item_id, "title": None, "reason": "Not in the current list. Reload the list."})
-        elif not item.leavable:
-            rejected.append({"id": item_id, "title": item.title, "reason": item.reason})
+        reason = "Not in the current list. Reload the list." if item is None else ineligibility(item, action)
+        if reason:
+            rejected.append({"id": item_id, "title": item.title if item else None, "reason": reason})
         else:
             accepted.append(item)
 
@@ -252,8 +280,9 @@ async def leave_prepare(request):
     token = None
     if accepted:
         token = secrets.token_urlsafe(24)
-        st.prepared[token] = Prepared(ids=[it.id for it in accepted], expires=now + PREPARE_TTL)
+        st.prepared[token] = Prepared(action=action, ids=[it.id for it in accepted], expires=now + PREPARE_TTL)
     return web.json_response({
+        "action": action,
         "token": token,
         "expires_in": PREPARE_TTL,
         "items": [{"id": it.id, "title": it.title, "kind": it.kind} for it in accepted],
@@ -261,39 +290,67 @@ async def leave_prepare(request):
     })
 
 
-async def leave_start(request):
+async def actions_start(request):
     st = _state(request)
     backend = _backend(request)
-    token = _string_field(await _json_body(request), "token", 100)
+    body = await _json_body(request)
+    token = _string_field(body, "token", 100)
+    options = body.get("options") or {}
+    if not isinstance(options, dict) or not isinstance(options.get("block_bots", False), bool):
+        raise ServiceError("bad_request", "'options' is invalid.")
+    options = {"block_bots": options.get("block_bots", False)}
     async with st.start_lock:  # two clicks can't start two jobs
         if st.job and st.job.active:
-            raise ServiceError("job_active", "A leave job is already running.", 409)
+            raise ServiceError("job_active", "Another job is running.", 409)
         prepared = st.prepared.pop(token, None)  # single use
         if prepared is None or prepared.expires < time.time():
             raise ServiceError("bad_token", "This confirmation expired or was already used. Select again and confirm.", 409)
-        results = []
-        for item_id in prepared.ids:
-            item = backend.cached_item(item_id)
-            if item is not None and item.leavable:  # re-check: may have changed since prepare
-                results.append(ItemResult(id=item.id, title=item.title, kind=item.kind))
-        if not results:
-            raise ServiceError("nothing_to_leave", "None of the confirmed items can be left any more.", 409)
-        job = LeaveJob(items=results, delay=st.cfg.leave_delay_seconds, max_auto_wait=st.cfg.max_auto_flood_wait)
-        st.job = job
-        st.job_task = asyncio.create_task(job.run(backend))
-        log.info("leave job %s started with %d items", job.id, len(results))
+        items = [backend.cached_item(i) for i in prepared.ids]
+        # Re-check: things may have changed since prepare.
+        items = [it for it in items if it is not None and ineligibility(it, prepared.action) is None]
+        if not items:
+            raise ServiceError("nothing_to_do", "None of the confirmed items qualify any more.", 409)
+
+        async def operation(item_id):
+            return await backend.perform(prepared.action, item_id, options)
+
+        job = _launch(st, prepared.action, items, operation)
     return web.json_response(job.to_json())
 
 
-async def leave_job(request):
+async def scan_start(request):
+    """Read-only: fill in when you last read / posted. Scans the given ids, or everything that needs it."""
+    st = _state(request)
+    backend = _backend(request)
+    body = await _json_body(request)
+    async with st.start_lock:
+        _check_can_start(st, "scan")
+        if body.get("ids") is not None:
+            items = [backend.cached_item(i) for i in _validate_ids(body["ids"])]
+            items = [it for it in items if it is not None and it.accessible]
+        else:
+            items = [it for it in st.last_list.items if it.accessible and _needs_scan(it)]
+        if not items:
+            raise ServiceError("nothing_to_do", "Nothing needs scanning: your activity is already known for every chat.", 409)
+        job = _launch(st, "scan", items, backend.scan)
+    return web.json_response(job.to_json())
+
+
+def _needs_scan(item) -> bool:
+    if item.kind == "other" or item.scanned_at is not None:
+        return False
+    return item.last_read_at is None or (item.can_post and item.my_last_message_at is None)
+
+
+async def job_status(request):
     job = _state(request).job
     return web.json_response({"job": job.to_json() if job else None})
 
 
-async def leave_cancel(request):
+async def job_cancel(request):
     job = _state(request).job
     if not job or not job.active:
-        raise ServiceError("no_job", "No leave job is running.", 409)
+        raise ServiceError("no_job", "No job is running.", 409)
     job.cancel()
     return web.json_response(job.to_json())
 
@@ -310,10 +367,11 @@ def create_app(cfg: Config, backend: Backend, *, demo: bool = False) -> web.Appl
     app.router.add_post("/api/login/cancel", login_cancel)
     app.router.add_post("/api/logout", logout)
     app.router.add_get("/api/dialogs", dialogs)
-    app.router.add_post("/api/leave/prepare", leave_prepare)
-    app.router.add_post("/api/leave/start", leave_start)
-    app.router.add_get("/api/leave/job", leave_job)
-    app.router.add_post("/api/leave/cancel", leave_cancel)
+    app.router.add_post("/api/actions/prepare", actions_prepare)
+    app.router.add_post("/api/actions/start", actions_start)
+    app.router.add_post("/api/scan/start", scan_start)
+    app.router.add_get("/api/job", job_status)
+    app.router.add_post("/api/job/cancel", job_cancel)
     # Preflight requests are answered by the middleware before routing.
     app.router.add_route("OPTIONS", "/{tail:.*}", lambda r: web.Response(status=204))
 
@@ -335,7 +393,7 @@ def create_app(cfg: Config, backend: Backend, *, demo: bool = False) -> web.Appl
 
 def run(cfg: Config, backend: Backend, *, demo: bool = False) -> None:
     app = create_app(cfg, backend, demo=demo)
-    print(f"TG Group Cleaner service on http://127.0.0.1:{cfg.port}"
+    print(f"TG Cleaner service on http://127.0.0.1:{cfg.port}"
           f"{'  [DEMO MODE: no Telegram connection]' if demo else ''}")
     print("Keep this window open while you use the extension. Press Ctrl+C to stop.")
     web.run_app(app, host="127.0.0.1", port=cfg.port, access_log=None, print=None)

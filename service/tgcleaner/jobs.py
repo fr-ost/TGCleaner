@@ -1,8 +1,8 @@
-"""Sequential bulk-leave job.
+"""Sequential batch jobs: leave/remove, archive, mute, and the read-only engagement scan.
 
 Rules:
   * One item at a time, with a pause between requests.
-  * An item is "left" only after Telegram answered the leave request without error.
+  * An item counts as done only after Telegram answered without error.
   * FLOOD_WAIT: wait it out once per item if it is short; otherwise stop the batch
     and mark everything not yet attempted as "rate_limited" (retryable later).
     Telethon additionally refuses to resend a flood-waited request early.
@@ -17,22 +17,19 @@ import asyncio
 import logging
 import secrets
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
-from .models import Backend, LeaveFailed, NotMember, RateLimited
+from .models import ActionFailed, RateLimited
 
-log = logging.getLogger("tgcleaner.leave")
+log = logging.getLogger("tgcleaner.jobs")
 
-# Item statuses
+# Item statuses. Success statuses come from the operation: left, removed, not_member, archived, muted, scanned.
 PENDING = "pending"
 IN_PROGRESS = "in_progress"
-LEFT = "left"                  # Telegram confirmed the leave
-NOT_MEMBER = "not_member"      # Telegram says we are not a participant (already left)
 FAILED = "failed"
 RATE_LIMITED = "rate_limited"  # not attempted (or not completed) because of a long flood wait
 CANCELLED = "cancelled"        # not attempted because you cancelled
-
-DONE_STATUSES = {LEFT, NOT_MEMBER}
 
 # Job states
 RUNNING = "running"
@@ -40,6 +37,9 @@ WAITING = "waiting"            # sleeping through a flood wait
 FINISHED = "finished"
 STOPPED_RATE_LIMIT = "stopped_rate_limited"
 CANCELLED_JOB = "cancelled"
+
+# (item id) -> (status, message); raises RateLimited or ActionFailed
+Operation = Callable[[str], Awaitable[tuple[str, str]]]
 
 
 @dataclass
@@ -60,7 +60,8 @@ class ItemResult:
 
 
 @dataclass
-class LeaveJob:
+class BatchJob:
+    kind: str                    # leave | archive | mute | scan
     items: list[ItemResult]
     delay: float
     max_auto_wait: int
@@ -89,6 +90,7 @@ class LeaveJob:
         processed = sum(1 for it in self.items if it.status not in (PENDING, IN_PROGRESS))
         return {
             "id": self.id,
+            "kind": self.kind,
             "state": self.state,
             "total": len(self.items),
             "processed": processed,
@@ -111,37 +113,30 @@ class LeaveJob:
         except asyncio.TimeoutError:
             return True
 
-    async def run(self, backend: Backend) -> None:
+    async def run(self, operation: Operation) -> None:
         try:
-            await self._run(backend)
+            await self._run(operation)
         except Exception:  # never leave a job stuck in "running"
-            log.exception("leave job crashed")
+            log.exception("%s job crashed", self.kind)
             for it in self.items:
                 if it.status in (PENDING, IN_PROGRESS):
-                    it.status = FAILED
-                    it.message = "Internal error; this item was not confirmed. Reload the list and retry."
-                    it.retryable = True
+                    self._finish(it, FAILED, "Internal error; this item was not confirmed. Reload the list and retry.",
+                                 retryable=True)
             self.state = FINISHED
         finally:
             self.wait_until = None
             self.finished_at = time.time()
 
-    async def _run(self, backend: Backend) -> None:
+    async def _run(self, operation: Operation) -> None:
         for index, item in enumerate(self.items):
-            if self._cancel.is_set():
-                self._mark_rest(index, CANCELLED, "Not attempted: you cancelled.")
-                self.state = CANCELLED_JOB
-                return
-            if index > 0 and not await self._pause(self.delay):
-                self._mark_rest(index, CANCELLED, "Not attempted: you cancelled.")
-                self.state = CANCELLED_JOB
-                return
+            if self._cancel.is_set() or (index > 0 and not await self._pause(self.delay)):
+                return self._stop_cancelled(index)
 
             waited = False
             while True:
                 item.status = IN_PROGRESS
                 try:
-                    await backend.leave(item.id)
+                    status, message = await operation(item.id)
                 except RateLimited as e:
                     if not waited and e.seconds <= self.max_auto_wait:
                         waited = True
@@ -154,26 +149,25 @@ class LeaveJob:
                         self.state = RUNNING
                         self.wait_until = None
                         if not ok:
-                            self._mark_rest(index, CANCELLED, "Not attempted: you cancelled.")
-                            self.state = CANCELLED_JOB
-                            return
+                            return self._stop_cancelled(index)
                         continue
                     self.retry_after = time.time() + e.seconds
                     when = time.strftime("%H:%M", time.localtime(self.retry_after))
                     self._mark_rest(index, RATE_LIMITED,
                                     f"Not attempted: Telegram asked to wait {e.seconds} s. Retry after {when}.")
                     self.state = STOPPED_RATE_LIMIT
-                    return
-                except NotMember:
-                    self._finish(item, NOT_MEMBER, "Telegram says you are not a member (already left).")
-                    backend.mark_left(item.id, "You already left this.")
-                except LeaveFailed as e:
+                    return None
+                except ActionFailed as e:
                     self._finish(item, FAILED, e.message, retryable=e.retryable)
                 else:
-                    self._finish(item, LEFT, "Left (confirmed by Telegram).")
-                    backend.mark_left(item.id, "You left this.")
+                    self._finish(item, status, message)
                 break
         self.state = FINISHED
+        return None
+
+    def _stop_cancelled(self, index: int) -> None:
+        self._mark_rest(index, CANCELLED, "Not attempted: you cancelled.")
+        self.state = CANCELLED_JOB
 
     def _finish(self, item: ItemResult, status: str, message: str, retryable: bool = False) -> None:
         item.status = status

@@ -79,6 +79,8 @@ class Config:
     # Pause between two leave requests. Telegram does not publish exact limits;
     # a couple of seconds keeps bulk leaving well clear of flood waits.
     leave_delay_seconds: float = 2.0
+    # Pause between items of the read-only engagement scan (1-2 small requests per item).
+    scan_delay_seconds: float = 1.0
     # Flood waits up to this long are waited out automatically (once per item).
     # Longer ones stop the batch so you can retry later.
     max_auto_flood_wait: int = 300
@@ -91,6 +93,7 @@ class Config:
             raise ValueError("port must be between 1024 and 65535")
         self.extension_ids = [validate_extension_id(x) for x in self.extension_ids]
         self.leave_delay_seconds = max(0.5, float(self.leave_delay_seconds))
+        self.scan_delay_seconds = max(0.3, float(self.scan_delay_seconds))
         self.max_auto_flood_wait = max(0, int(self.max_auto_flood_wait))
 
     @property
