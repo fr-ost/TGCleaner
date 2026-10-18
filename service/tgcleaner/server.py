@@ -30,8 +30,11 @@ import logging
 import re
 import secrets
 import time
+import os
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urlsplit
 
 from aiohttp import web
 
@@ -107,8 +110,14 @@ def make_security_middleware(cfg: Config, access_token: str | None = None, cloud
         if request.path == "/health":
             # Lets the start script / you check the service is up. Reveals nothing.
             return web.json_response({"ok": True, "app": "tgcleaner"})
+        if not request.path.startswith("/api/"):
+            return await handler(request)  # the web dashboard's static files
         origin = request.headers.get("Origin")
-        if origin not in allowed_origins:
+        # The dashboard served by this service itself is same-origin: browsers send either our own
+        # origin or (for same-origin GETs) no Origin plus "Sec-Fetch-Site: same-origin".
+        same_origin = (urlsplit(origin).netloc == request.host) if origin else (
+            request.headers.get("Sec-Fetch-Site") == "same-origin")
+        if origin not in allowed_origins and not same_origin:
             log.warning("rejected request from origin %r to %s", origin, request.path)
             return _error(403, "origin_not_allowed",
                           "Only the TG Cleaner extension may use this service.")
@@ -152,8 +161,11 @@ def make_security_middleware(cfg: Config, access_token: str | None = None, cloud
     return security
 
 
-def _cors(response: web.Response, origin: str) -> web.Response:
-    response.headers.update(_cors_headers(origin))
+def _cors(response: web.Response, origin: str | None) -> web.Response:
+    if origin:
+        response.headers.update(_cors_headers(origin))
+    else:
+        response.headers["Cache-Control"] = "no-store"
     return response
 
 
@@ -375,6 +387,17 @@ def _needs_scan(item) -> bool:
     return item.last_read_at is None or (item.can_post and item.my_last_message_at is None)
 
 
+async def protect(request):
+    """Mark or unmark chats as protected. Protected chats are refused by every action."""
+    body = await _json_body(request)
+    ids = _validate_ids(body.get("ids"))
+    value = body.get("protected")
+    if not isinstance(value, bool):
+        raise ServiceError("bad_request", "'protected' must be true or false.")
+    found = _backend(request).set_protected(ids, value)
+    return web.json_response({"ok": True, "protected": value, "ids": found})
+
+
 async def job_status(request):
     job = _state(request).job
     return web.json_response({"job": job.to_json() if job else None})
@@ -386,6 +409,45 @@ async def job_cancel(request):
         raise ServiceError("no_job", "No job is running.", 409)
     job.cancel()
     return web.json_response(job.to_json())
+
+
+# The web dashboard: the same files as the Chrome extension, served at "/" (e.g. on Railway).
+WEB_FILES = {
+    "": ("dashboard.html", "text/html"),
+    "dashboard.html": ("dashboard.html", "text/html"),
+    "dashboard.css": ("dashboard.css", "text/css"),
+    "dashboard.js": ("dashboard.js", "text/javascript"),
+    "api.js": ("api.js", "text/javascript"),
+    "logic.js": ("logic.js", "text/javascript"),
+    "icons/icon16.png": ("icons/icon16.png", "image/png"),
+    "icons/icon32.png": ("icons/icon32.png", "image/png"),
+    "icons/icon48.png": ("icons/icon48.png", "image/png"),
+    "icons/icon128.png": ("icons/icon128.png", "image/png"),
+}
+WEB_HEADERS = {
+    "Content-Security-Policy": ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; "
+                                "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"),
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-cache",
+}
+
+
+def web_dir() -> Path | None:
+    configured = os.environ.get("TGC_WEB_DIR")
+    path = Path(configured) if configured else Path(__file__).resolve().parents[2] / "extension"
+    return path if (path / "dashboard.html").is_file() else None
+
+
+async def web_file(request):
+    """Serve one of a fixed set of dashboard files (no directory listing, no path traversal)."""
+    root = web_dir()
+    entry = WEB_FILES.get(request.match_info["path"])
+    if root is None or entry is None:
+        raise web.HTTPNotFound()
+    name, content_type = entry
+    return web.Response(body=(root / name).read_bytes(), content_type=content_type,
+                        charset="utf-8" if content_type.startswith("text/") else None, headers=WEB_HEADERS)
 
 
 def create_app(cfg: Config, backend: Backend, *, demo: bool = False,
@@ -405,8 +467,10 @@ def create_app(cfg: Config, backend: Backend, *, demo: bool = False,
     app.router.add_post("/api/actions/prepare", actions_prepare)
     app.router.add_post("/api/actions/start", actions_start)
     app.router.add_post("/api/scan/start", scan_start)
+    app.router.add_post("/api/protect", protect)
     app.router.add_get("/api/job", job_status)
     app.router.add_post("/api/job/cancel", job_cancel)
+    app.router.add_get("/{path:(|dashboard\\.html|dashboard\\.css|dashboard\\.js|api\\.js|logic\\.js|icons/icon\\d+\\.png)}", web_file)
     # Preflight requests are answered by the middleware before routing.
     app.router.add_route("OPTIONS", "/{tail:.*}", lambda r: web.Response(status=204))
 
@@ -436,8 +500,10 @@ def run(cfg: Config, backend: Backend, *, demo: bool = False, access_token: str 
                   "logged-in Telegram session. Delete the deployment when you're done.", flush=True)
         # Cloud mode: reachable from outside (behind the platform's HTTPS proxy), token required.
         print(f"TG Cleaner service (cloud mode) listening on 0.0.0.0:{cfg.port}{demo_note}", flush=True)
+        print("Open the service's public URL in a browser to use the dashboard.", flush=True)
         web.run_app(app, host="0.0.0.0", port=cfg.port, access_log=None, print=None)
         return
     print(f"TG Cleaner service on http://127.0.0.1:{cfg.port}{demo_note}")
+    print(f"Dashboard: open http://127.0.0.1:{cfg.port} in your browser (or use the Chrome extension).")
     print("Keep this window open while you use the extension. Press Ctrl+C to stop.")
     web.run_app(app, host="127.0.0.1", port=cfg.port, access_log=None, print=None)

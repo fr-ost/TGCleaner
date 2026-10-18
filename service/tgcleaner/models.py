@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Protocol
 
@@ -41,6 +41,11 @@ class DialogItem:
     last_read_at: datetime | None = None       # date of the newest message you have read
     my_last_message_at: datetime | None = None  # date of your newest message there
     scanned_at: datetime | None = None          # when the engagement scan last looked at this item
+    # Signals that a chat may matter to you (shown, filterable, used by the safety guard).
+    pinned: bool = False
+    folders: list[str] = field(default_factory=list)  # your Telegram chat folders that list it explicitly
+    unread_mentions: int = 0
+    protected: bool = False      # you marked it: no action may touch it
 
     @property
     def link(self) -> str | None:
@@ -66,11 +71,17 @@ class DialogItem:
             "last_read_at": iso(self.last_read_at),
             "my_last_message_at": iso(self.my_last_message_at),
             "scanned_at": iso(self.scanned_at),
+            "pinned": self.pinned,
+            "folders": self.folders,
+            "unread_mentions": self.unread_mentions,
+            "protected": self.protected,
         }
 
 
 def ineligibility(item: DialogItem, action: str) -> str | None:
     """Why `action` can't be applied to `item`, or None if it can."""
+    if item.protected:
+        return "Protected by you. Unprotect it first if you really want to change it."
     if action == LEAVE:
         return None if item.leavable else (item.reason or "This can't be left here.")
     if not item.accessible:
@@ -158,6 +169,10 @@ class Backend(Protocol):
 
         Raises RateLimited or ActionFailed otherwise.
         """
+        ...
+
+    def set_protected(self, ids: list[str], value: bool) -> list[str]:
+        """Mark/unmark items as protected (persisted). Returns the ids that were found."""
         ...
 
     async def scan(self, item_id: str) -> tuple[str, str]:

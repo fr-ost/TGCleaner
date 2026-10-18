@@ -1,7 +1,37 @@
 // Client for the TG Cleaner service: local (http://127.0.0.1:8765, the default) or hosted (https://…, e.g. Railway).
-// The service keeps the Telegram session. For a hosted service the extension stores its access token.
+// The service keeps the Telegram session. The same files run as the Chrome extension and as the web
+// dashboard the service serves at "/" (then the address is simply the page's own origin).
 
 export const DEFAULT_URL = "http://127.0.0.1:8765";
+
+/** True inside the Chrome extension; false when the page is served by the service itself. */
+export const inExtension = typeof chrome !== "undefined" && Boolean(chrome.runtime?.id && chrome.storage?.local);
+
+/** Small key/value storage: chrome.storage in the extension, localStorage on the web. */
+export async function storageGet(keys) {
+  if (inExtension) return chrome.storage.local.get(keys);
+  const out = {};
+  for (const key of keys) {
+    try {
+      const raw = localStorage.getItem(`tgc:${key}`);
+      if (raw !== null) out[key] = JSON.parse(raw);
+    } catch {
+      // unavailable or corrupt: treat as unset
+    }
+  }
+  return out;
+}
+
+export async function storageSet(values) {
+  if (inExtension) return chrome.storage.local.set(values);
+  for (const [key, value] of Object.entries(values)) {
+    try {
+      localStorage.setItem(`tgc:${key}`, JSON.stringify(value));
+    } catch {
+      // private mode etc.: settings just won't persist
+    }
+  }
+}
 
 export class ApiError extends Error {
   constructor(status, code, message) {
@@ -11,7 +41,7 @@ export class ApiError extends Error {
   }
 }
 
-let baseUrl = DEFAULT_URL;
+let baseUrl = inExtension || typeof location === "undefined" ? DEFAULT_URL : location.origin;
 let accessToken = "";
 
 /**
@@ -36,8 +66,10 @@ export const isLocal = (url = baseUrl) => /^http:\/\/(127\.0\.0\.1|localhost)(:\
 
 export async function loadSettings() {
   try {
-    const { serviceUrl, accessToken: token, port } = await chrome.storage.local.get(["serviceUrl", "accessToken", "port"]);
-    if (serviceUrl) baseUrl = normalizeServiceUrl(serviceUrl);
+    const { serviceUrl, accessToken: token, port } = await storageGet(["serviceUrl", "accessToken", "port"]);
+    if (!inExtension) {
+      // served by the service: always talk to it
+    } else if (serviceUrl) baseUrl = normalizeServiceUrl(serviceUrl);
     else if (Number.isInteger(Number(port)) && port) baseUrl = `http://127.0.0.1:${Number(port)}`; // older versions stored only a port
     accessToken = typeof token === "string" ? token : "";
   } catch {
@@ -47,11 +79,11 @@ export async function loadSettings() {
 }
 
 export async function saveSettings(serviceUrl, token) {
-  const url = normalizeServiceUrl(serviceUrl);
+  const url = inExtension ? normalizeServiceUrl(serviceUrl) : baseUrl;
   const cleaned = String(token ?? "").trim();
   baseUrl = url;
   accessToken = cleaned;
-  await chrome.storage.local.set({ serviceUrl: url, accessToken: cleaned });
+  await storageSet({ serviceUrl: url, accessToken: cleaned });
 }
 
 export function currentSettings() {

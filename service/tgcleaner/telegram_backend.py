@@ -34,6 +34,7 @@ from telethon import TelegramClient, errors, functions, types, utils
 
 from . import __version__
 from .config import Config, make_private, session_path
+from .protect import load_protected, save_protected
 from .models import (
     ARCHIVE, BOT, BROADCAST_GROUP, CHANNEL, GROUP, LEAVE, MUTE, OTHER, SUPERGROUP,
     ActionFailed, DialogItem, DialogList, RateLimited, ServiceError, ineligibility, iso, parse_iso,
@@ -229,6 +230,7 @@ class TelethonBackend:
         self._me = None
         self._connect_error: str | None = None
         self._entries: dict[str, _Entry] = {}
+        self._protected: set[str] = load_protected(data_dir)
 
     def _make_client(self) -> TelegramClient:
         return TelegramClient(
@@ -473,6 +475,7 @@ class TelethonBackend:
         entries: dict[str, _Entry] = {}
         excluded = {"private_chat": 0, "saved_messages": 0, "unreadable": 0}
         cache = self._read_scan_cache()
+        folder_names = await self._folder_map()
         for folder in (0, 1):  # main list, then Archive
             async for raw, entity, message in self._iter_folder(folder):
                 try:
@@ -494,6 +497,10 @@ class TelethonBackend:
                     entry = _Entry(item=item, peer=peer, read_max_id=getattr(raw, "read_inbox_max_id", 0) or 0,
                                    is_bot=isinstance(entity, types.User) and bool(entity.bot))
                     _apply_cached_scan(entry, cache.get(item.id))
+                    item.pinned = bool(getattr(raw, "pinned", False))
+                    item.unread_mentions = getattr(raw, "unread_mentions_count", 0) or 0
+                    item.folders = folder_names.get(item.id, [])
+                    item.protected = item.id in self._protected
                 except Exception:
                     # One odd chat must never break the whole list.
                     log.exception("skipped a chat that could not be read (%s)", type(entity).__name__)
@@ -504,6 +511,43 @@ class TelethonBackend:
         self._entries = entries
         log.info("loaded %d chats (%s)", len(items), ", ".join(f"{k}: {v}" for k, v in excluded.items()))
         return DialogList(items=items, excluded=excluded, loaded_at=datetime.now(timezone.utc))
+
+    async def _folder_map(self) -> dict[str, list[str]]:
+        """Chat id -> names of your Telegram chat folders that list it explicitly (best effort)."""
+        try:
+            result = await self._call_patiently(functions.messages.GetDialogFiltersRequest())
+        except Exception as e:  # folders are a hint only; never block the list on them
+            log.warning("could not read your chat folders: %s", type(e).__name__)
+            return {}
+        # Newer layers wrap the list in messages.dialogFilters; older ones return a plain list.
+        filters = getattr(result, "filters", result if isinstance(result, list) else [])
+        names: dict[str, list[str]] = {}
+        for f in filters or []:
+            if not isinstance(f, (types.DialogFilter, types.DialogFilterChatlist)):
+                continue
+            title = str(getattr(f.title, "text", f.title) or "Folder")
+            for peer in list(f.pinned_peers or []) + list(f.include_peers or []):
+                try:
+                    peer_id = str(utils.get_peer_id(peer))
+                except Exception:
+                    continue
+                if title not in names.setdefault(peer_id, []):
+                    names[peer_id].append(title)
+        return names
+
+    def set_protected(self, ids: list[str], value: bool) -> list[str]:
+        found = []
+        for item_id in ids:
+            if value:
+                self._protected.add(item_id)
+            else:
+                self._protected.discard(item_id)
+            entry = self._entries.get(item_id)
+            if entry:
+                entry.item.protected = value
+                found.append(item_id)
+        save_protected(self._data_dir, self._protected)
+        return found
 
     async def _iter_folder(self, folder: int):
         """Yield (raw dialog, entity, top message) for every dialog in one folder, page by page.

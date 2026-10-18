@@ -32,6 +32,7 @@ export const ACTIONS = {
 
 /** Mirrors the service's eligibility rules. Returns null when allowed, else the reason. */
 export function ineligibility(item, action) {
+  if (item.protected) return "Protected by you. Unprotect it first if you really want to change it.";
   if (action === "leave") return item.leavable ? null : (item.reason || "This can't be left here.");
   if (item.accessible === false) return "You no longer have access to this.";
   if (item.kind === "other") return "This type isn't supported by this tool.";
@@ -106,20 +107,46 @@ export function normalize(text) {
   return String(text ?? "").toLocaleLowerCase().normalize("NFKD").replace(/[̀-ͯ]/g, "");
 }
 
+const SIZE_RANGES = { lt100: [0, 99], "100-1k": [100, 999], "1k-10k": [1000, 9999], "10k+": [10000, Infinity] };
+
 /**
- * filters: { query, show: all|inactive|active|unknown|unavailable, kind: all|groups|<kind>, threshold,
- *            basis: chat|you, action, muted: any|muted|unmuted, unreadOnly }
+ * filters: { query, show: all|inactive|active|unknown|unavailable, kind: all|groups|channel|supergroup|group|bot,
+ *            threshold, basis: chat|you, action, muted: any|muted|unmuted, unreadOnly,
+ *            role: any|member|admin, visibility: any|public|private, pinned: any|yes|no, folder: any|yes|no,
+ *            size: any|lt100|100-1k|1k-10k|10k+, posted: any|yes|never, mentionsOnly, protection: any|hide|only }
  */
 export function matchesFilters(item, filters, now) {
   const kind = filters.kind || "all";
   if (kind === "groups") {
     if (!["supergroup", "gigagroup", "group"].includes(item.kind)) return false;
+  } else if (kind === "supergroup") {
+    if (item.kind !== "supergroup" && item.kind !== "gigagroup") return false;
   } else if (kind !== "all" && item.kind !== kind) {
     return false;
   }
   if (filters.muted === "muted" && !item.muted) return false;
   if (filters.muted === "unmuted" && item.muted) return false;
   if (filters.unreadOnly && !(item.unread_count > 0)) return false;
+  const admin = item.role === "owner" || item.role === "admin";
+  if (filters.role === "admin" && !admin) return false;
+  if (filters.role === "member" && admin) return false;
+  if (filters.visibility === "public" && !item.username) return false;
+  if (filters.visibility === "private" && item.username) return false;
+  if (filters.pinned === "yes" && !item.pinned) return false;
+  if (filters.pinned === "no" && item.pinned) return false;
+  const inFolder = (item.folders?.length ?? 0) > 0;
+  if (filters.folder === "yes" && !inFolder) return false;
+  if (filters.folder === "no" && inFolder) return false;
+  if (filters.size && filters.size !== "any") {
+    const range = SIZE_RANGES[filters.size];
+    const n = item.participants_count;
+    if (!range || n === null || n === undefined || n < range[0] || n > range[1]) return false;
+  }
+  if (filters.posted === "yes" && !item.my_last_message_at) return false;
+  if (filters.posted === "never" && !(item.can_post && item.scanned_at && !item.my_last_message_at)) return false;
+  if (filters.mentionsOnly && !(item.unread_mentions > 0)) return false;
+  if (filters.protection === "hide" && item.protected) return false;
+  if (filters.protection === "only" && !item.protected) return false;
   const show = filters.show || "all";
   if (show === "unavailable") {
     if (eligible(item, filters.action || "leave")) return false;
@@ -166,7 +193,7 @@ export function sortItems(items, key, basis = "chat") {
 }
 
 export function summarize(items, thresholdDays, now, basis = "chat", action = "leave") {
-  const s = { total: items.length, inactive: 0, active: 0, unknown: 0, unavailable: 0, inactiveSelectable: 0, needsScan: 0, bots: 0 };
+  const s = { total: items.length, inactive: 0, active: 0, unknown: 0, unavailable: 0, inactiveSelectable: 0, needsScan: 0, bots: 0, protected: 0 };
   for (const it of items) {
     const a = activityOf(it, thresholdDays, now, basis);
     s[a] += 1;
@@ -174,19 +201,44 @@ export function summarize(items, thresholdDays, now, basis = "chat", action = "l
     else if (a === "inactive") s.inactiveSelectable += 1;
     if (needsScan(it)) s.needsScan += 1;
     if (it.kind === "bot") s.bots += 1;
+    if (it.protected) s.protected += 1;
   }
   return s;
 }
 
+/** The safety guard keeps chats that look structurally important out of bulk selection. */
+export function guardReason(item) {
+  if (item.pinned) return "pinned";
+  if (item.folders?.length) return `in your folder “${item.folders[0]}”`;
+  if (item.role === "owner" || item.role === "admin") return "you're an admin";
+  return null;
+}
+
+/** Why a chat may matter to you, for the confirmation's "looks important" check. */
+export function importanceReasons(item, now) {
+  const reasons = [];
+  if (item.pinned) reasons.push("pinned");
+  if (item.folders?.length) reasons.push(`in folder ${item.folders.map((f) => `“${f}”`).join(", ")}`);
+  if (item.role === "owner" || item.role === "admin") reasons.push("you're an admin");
+  const posted = daysSince(item.my_last_message_at, now);
+  if (posted !== null && posted < 30) reasons.push(`you posted ${formatAgo(posted).toLowerCase()}`);
+  const read = daysSince(item.last_read_at, now);
+  const chat = daysSince(item.last_message_at, now);
+  if (read !== null && read < 7 && item.unread_count > 0) reasons.push(`you read it ${formatAgo(read).toLowerCase()}`);
+  else if (read !== null && read < 7 && chat !== null && chat < 7) reasons.push("you're reading it");
+  if (item.unread_mentions > 0) reasons.push(`${item.unread_mentions} unread mention${item.unread_mentions === 1 ? "" : "s"}`);
+  return reasons;
+}
+
 /** Ids "Select inactive" adds: eligible for the action and known to be inactive. Unknown is never included. */
-export function inactiveIds(items, thresholdDays, now, basis = "chat", action = "leave") {
+export function inactiveIds(items, thresholdDays, now, basis = "chat", action = "leave", guard = false) {
   return items
-    .filter((it) => eligible(it, action) && activityOf(it, thresholdDays, now, basis) === "inactive")
+    .filter((it) => eligible(it, action) && !(guard && guardReason(it)) && activityOf(it, thresholdDays, now, basis) === "inactive")
     .map((it) => it.id);
 }
 
-export function selectableIds(items, action = "leave") {
-  return items.filter((it) => eligible(it, action)).map((it) => it.id);
+export function selectableIds(items, action = "leave", guard = false) {
+  return items.filter((it) => eligible(it, action) && !(guard && guardReason(it))).map((it) => it.id);
 }
 
 /** Drop selected ids that are no longer listed or no longer eligible for the action. */

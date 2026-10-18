@@ -168,7 +168,7 @@ input[type="checkbox"]:disabled { cursor: not-allowed; opacity: .45; }
 .list { overflow: hidden; }
 .list-head, .item {
   display: grid;
-  grid-template-columns: 40px minmax(0, 1fr) 104px 132px 210px 176px;
+  grid-template-columns: 62px minmax(0, 1fr) 104px 132px 210px 176px;
   align-items: center;
   gap: 10px;
   padding: 0 14px;
@@ -306,3 +306,36 @@ dialog::backdrop { background: rgba(10, 15, 22, .55); }
   .item .kind { grid-area: meta; }
   .item .status-cell { grid-area: status; text-align: right; }
 }
+
+/* ---------- type chips, more filters, protection ---------- */
+.segmented { display: inline-flex; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; flex-wrap: wrap; }
+.segmented button {
+  font: inherit; font-size: 13px; font-weight: 550; border: 0; background: var(--surface); color: var(--muted);
+  padding: 7px 14px; cursor: pointer; border-right: 1px solid var(--border);
+}
+.segmented button:last-child { border-right: 0; }
+.segmented button:hover { color: var(--text); background: var(--surface-2); }
+.segmented button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+.safety { margin-left: auto; font-weight: 600; }
+.more-filters summary { font-size: 13px; color: var(--muted); padding: 2px 0; }
+.more-filters[open] summary { margin-bottom: 8px; }
+.filter-grid { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; }
+#activeFilterCount:empty { display: none; }
+#activeFilterCount { background: var(--accent); color: #fff; margin-left: 4px; }
+.protect-btn {
+  border: 0; background: transparent; cursor: pointer; font-size: 15px; padding: 2px 4px; border-radius: 6px;
+  opacity: .35; filter: grayscale(1);
+}
+.protect-btn:hover { opacity: .8; filter: none; background: var(--surface-2); }
+.item.is-protected .protect-btn { opacity: 1; filter: none; }
+.item.is-protected { box-shadow: inset 3px 0 0 var(--ok); }
+.tag-protected, .tag-folder, .tag-pinned { display: none; }
+.is-protected .tag-protected, .is-pinned .tag-pinned { display: inline-block; }
+.tag-folder.has { display: inline-block; }
+.tag-protected { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
+.tag-mention { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+.cb { gap: 2px; }
+.flagged { border: 1px solid var(--warn); background: var(--warn-soft); border-radius: 10px; padding: 10px 12px; margin: 10px 0; }
+.flagged h3 { margin: 0 0 4px; color: var(--warn); }
+.flagged .confirm-list { background: var(--surface); max-height: 26vh; }
+.confirm-list li.flag::marker { color: var(--warn); }

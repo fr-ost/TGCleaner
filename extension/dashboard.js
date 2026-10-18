@@ -1,8 +1,10 @@
-import { ApiError, api, currentSettings, isLocal, loadSettings, saveSettings } from "./api.js";
+import {
+  ApiError, api, currentSettings, inExtension, isLocal, loadSettings, saveSettings, storageGet, storageSet,
+} from "./api.js";
 import {
   ACTIONS, KIND_LABELS, PRESET_THRESHOLDS, ROLE_LABELS, activityOf, daysSince, eligible, engagementIso,
-  estimateSeconds, formatAgo, formatDate, formatDuration, inactiveIds, ineligibility, matchesFilters, needsScan,
-  parseThreshold, pruneSelection, retryableIds, selectableIds, sortItems, summarize,
+  estimateSeconds, formatAgo, formatDate, formatDuration, guardReason, importanceReasons, inactiveIds, ineligibility,
+  matchesFilters, needsScan, parseThreshold, pruneSelection, retryableIds, selectableIds, sortItems, summarize,
 } from "./logic.js";
 
 const $ = (id) => document.getElementById(id);
@@ -10,7 +12,14 @@ const $ = (id) => document.getElementById(id);
 const DEFAULT_PREFS = {
   threshold: 90, thresholdChoice: "90", show: "all", kind: "all", sort: "oldest",
   basis: "chat", action: "leave", muted: "any", unreadOnly: false,
+  role: "any", visibility: "any", pinned: "any", folder: "any", size: "any", posted: "any", protection: "any",
+  mentionsOnly: false, guard: true,
 };
+// "More filters" selects: element id -> preference key.
+const EXTRA_SELECTS = [["roleSelect", "role"], ["visibilitySelect", "visibility"], ["pinnedSelect", "pinned"],
+  ["folderSelect", "folder"], ["sizeSelect", "size"], ["postedSelect", "posted"], ["mutedSelect", "muted"],
+  ["protectionSelect", "protection"]];
+const EXTRA_CHECKS = [["unreadOnly", "unreadOnly"], ["mentionsOnly", "mentionsOnly"]];
 const SCAN_SECONDS_PER_ITEM = 1.6; // pause + up to two small requests
 
 const state = {
@@ -89,7 +98,7 @@ const actionWord = (act) => ACTIONS[act].label.toLowerCase();
 
 async function loadPrefs() {
   try {
-    const { prefs } = await chrome.storage.local.get("prefs");
+    const { prefs } = await storageGet(["prefs"]);
     if (prefs && typeof prefs === "object") state.prefs = { ...DEFAULT_PREFS, ...prefs };
   } catch {
     // defaults
@@ -99,7 +108,7 @@ async function loadPrefs() {
 }
 
 function savePrefs() {
-  chrome.storage.local.set({ prefs: state.prefs }).catch(() => {});
+  Promise.resolve(storageSet({ prefs: state.prefs })).catch(() => {});
 }
 
 function applyPrefsToControls() {
@@ -109,12 +118,15 @@ function applyPrefsToControls() {
   $("customField").hidden = preset;
   $("customDays").value = p.threshold;
   $("showSelect").value = p.show;
-  $("kindSelect").value = p.kind;
+  if (p.kind === "gigagroup" || p.kind === "other") p.kind = "all";
+  for (const b of document.querySelectorAll("#kindChips button")) b.setAttribute("aria-pressed", String(b.dataset.kind === p.kind));
+  for (const [id, key] of EXTRA_SELECTS) $(id).value = p[key];
+  for (const [id, key] of EXTRA_CHECKS) $(id).checked = Boolean(p[key]);
+  $("safetyGuard").checked = p.guard !== false;
+  updateFilterBadge();
   $("sortSelect").value = p.sort;
   $("basisSelect").value = p.basis;
   $("actionSelect").value = p.action;
-  $("mutedSelect").value = p.muted;
-  $("unreadOnly").checked = Boolean(p.unreadOnly);
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +184,11 @@ async function refreshStatus() {
 
 function showOffline(e) {
   const { serviceUrl, accessToken } = currentSettings();
+  if (!inExtension) {
+    // Web dashboard: it always talks to the service that served it; only the token is configurable.
+    $("urlInput").readOnly = true;
+    for (const li of document.querySelectorAll("#offlineView .steps li")) li.hidden = true;
+  }
   if ($("offlineView").hidden) {
     // Fill the fields only when the screen opens, so the automatic retries never overwrite your typing.
     $("urlInput").value = serviceUrl;
@@ -191,7 +208,7 @@ function showOffline(e) {
   } else if (e instanceof ApiError && e.code === "origin_not_allowed") {
     setConn("bad", "Service rejected this extension");
     $("offlineDetail").textContent =
-      `The service is running but does not accept this extension's ID (${chrome.runtime.id}). ` +
+      `The service is running but does not accept this extension's ID (${inExtension ? chrome.runtime.id : "?"}). ` +
       (isLocal(serviceUrl)
         ? "Run setup again and enter this ID, then restart the service."
         : "Add this ID to the service's TGC_EXTENSION_IDS variable and redeploy.");
@@ -343,7 +360,9 @@ function filters() {
   const p = state.prefs;
   return {
     query: state.query, show: p.show, kind: p.kind, threshold: p.threshold, basis: p.basis,
-    action: p.action, muted: p.muted, unreadOnly: p.unreadOnly,
+    action: p.action, muted: p.muted, unreadOnly: p.unreadOnly, role: p.role, visibility: p.visibility,
+    pinned: p.pinned, folder: p.folder, size: p.size, posted: p.posted, protection: p.protection,
+    mentionsOnly: p.mentionsOnly,
   };
 }
 
@@ -418,18 +437,22 @@ function renderList() {
 
 function makeRow(item) {
   const checkbox = el("input", { type: "checkbox", "aria-label": `Select ${item.title}` });
+  const shield = el("button", { type: "button", class: "protect-btn", text: "🛡", title: "Protect / unprotect", "aria-label": `Protect ${item.title}` });
   const sub = el("div", { class: "sub" });
   if (item.link && item.link.startsWith("https://t.me/")) {
     sub.append(el("a", { href: item.link, target: "_blank", rel: "noopener noreferrer", text: `@${item.username}` }));
   }
   const role = ROLE_LABELS[item.role];
   if (item.role === "owner" || item.role === "admin") sub.append(el("span", { class: "tag", text: role }));
+  sub.append(el("span", { class: "tag tag-protected", text: "🛡 Protected" }), el("span", { class: "tag tag-pinned", text: "📌 Pinned" }));
+  if (item.folders?.length) sub.append(el("span", { class: "tag tag-folder has", text: `📁 ${item.folders.join(", ")}` }));
   sub.append(el("span", { class: "tag tag-archived", text: "Archived" }), el("span", { class: "tag tag-muted", text: "Muted" }));
+  if (item.unread_mentions) sub.append(el("span", { class: "tag tag-mention", text: `@ ${item.unread_mentions}` }));
   if (item.participants_count) sub.append(el("span", { text: `${item.participants_count.toLocaleString()} members` }));
   if (item.unread_count) sub.append(el("span", { class: "unread", text: `${item.unread_count.toLocaleString()} unread` }));
 
   return el("div", { class: "item", dataset: { id: item.id }, role: "row" },
-    el("div", { class: "cb" }, checkbox),
+    el("div", { class: "cb" }, checkbox, shield),
     el("div", { class: "title-cell" }, el("div", { class: "title", text: item.title, title: item.title }), sub),
     el("div", { class: "kind", text: KIND_LABELS[item.kind] ?? item.kind }),
     el("div", { class: "when chat-when" }, el("span", { class: "ago" }), el("span", { class: "date muted" })),
@@ -474,6 +497,9 @@ function updateRow(row, item, now) {
   row.classList.toggle("disabled", !ok);
   row.classList.toggle("is-archived", Boolean(item.archived));
   row.classList.toggle("is-muted", Boolean(item.muted));
+  row.classList.toggle("is-protected", Boolean(item.protected));
+  row.classList.toggle("is-pinned", Boolean(item.pinned));
+  row.querySelector(".protect-btn").title = item.protected ? "Protected: click to unprotect" : "Protect: never leave, archive or mute this";
   const cb = row.querySelector("input");
   cb.checked = selected;
   cb.disabled = !ok || jobActive();
@@ -550,6 +576,12 @@ function setSelected(ids, value) {
 
 function onListClick(event) {
   if (event.target.closest("a")) return;
+  const shield = event.target.closest(".protect-btn");
+  if (shield) {
+    const item = state.byId.get(shield.closest(".item").dataset.id);
+    if (item && !jobActive()) setProtected([item.id], !item.protected);
+    return;
+  }
   const row = event.target.closest(".item");
   if (!row || jobActive()) return;
   const item = state.byId.get(row.dataset.id);
@@ -560,12 +592,62 @@ function onListClick(event) {
     // Shift+click selects/deselects the whole range in the current view.
     const from = Math.min(state.lastClicked, index);
     const to = Math.max(state.lastClicked, index);
-    setSelected(selectableIds(state.visible.slice(from, to + 1), action()), value);
+    setSelected(selectableIds(state.visible.slice(from, to + 1), action(), state.prefs.guard), value);
   } else {
     setSelected([item.id], value);
   }
   state.lastClicked = index;
   if (event.target.matches("input[type=checkbox]")) event.target.checked = state.selection.has(item.id);
+}
+
+// ---------------------------------------------------------------------------
+// protection & filters
+// ---------------------------------------------------------------------------
+
+/** Protected chats are refused by the service for every action; the list is saved there. */
+async function setProtected(ids, value) {
+  try {
+    const result = await api("/api/protect", { method: "POST", body: { ids, protected: value } });
+    for (const id of result.ids) {
+      const item = state.byId.get(id);
+      if (item) item.protected = value;
+      if (value) state.selection.delete(id);
+    }
+    toast(value ? `Protected ${plural(result.ids.length, "chat")}. They can't be left, archived or muted.`
+      : `Unprotected ${plural(result.ids.length, "chat")}.`);
+    render();
+    return result.ids;
+  } catch (e) {
+    toast(errorText(e), 6000);
+    return [];
+  }
+}
+
+function updateFilterBadge() {
+  const p = state.prefs;
+  const n = EXTRA_SELECTS.filter(([, key]) => p[key] !== DEFAULT_PREFS[key]).length +
+    EXTRA_CHECKS.filter(([, key]) => p[key]).length;
+  $("activeFilterCount").textContent = n ? String(n) : "";
+}
+
+let flaggedIds = [];
+
+/** From the confirm dialog: drop the chats that look important (optionally protecting them) and ask again. */
+async function reconfirmWithout(protect) {
+  const pending = state.pending;
+  if (!pending) return;
+  const drop = new Set(flaggedIds);
+  if (protect) await setProtected([...drop], true);
+  for (const id of drop) state.selection.delete(id);
+  $("confirmDialog").close("cancel");
+  const rest = pending.items.map((it) => it.id).filter((id) => !drop.has(id));
+  if (!rest.length) {
+    toast("Nothing left to do after leaving those out.");
+    render();
+    return;
+  }
+  render();
+  await prepareAndConfirm(pending.action, rest, $("applyBtn"));
 }
 
 // ---------------------------------------------------------------------------
@@ -614,6 +696,17 @@ async function prepareAndConfirm(act, ids, button) {
   $("confirmRejectedWrap").hidden = prepared.rejected.length === 0;
   $("confirmRejected").replaceChildren(...prepared.rejected.map((r) =>
     el("li", {}, el("strong", { text: r.title ?? r.id }), el("span", { class: "k", text: ` — ${r.reason ?? "not eligible"}` }))));
+  const now = Date.now();
+  const flagged = prepared.items
+    .map((it) => ({ it, reasons: importanceReasons(state.byId.get(it.id) ?? it, now) }))
+    .filter((f) => f.reasons.length);
+  flaggedIds = flagged.map((f) => f.it.id);
+  $("confirmFlaggedWrap").hidden = flagged.length === 0;
+  $("confirmFlaggedTitle").textContent = `${plural(flagged.length, "chat looks", "chats look")} important. Double-check:`;
+  $("confirmFlagged").replaceChildren(...flagged.map((f) =>
+    el("li", {}, el("strong", { text: f.it.title }), el("span", { class: "k", text: ` — ${f.reasons.join(", ")}` }))));
+  for (const li of $("confirmList").children) li.classList.toggle("flag", flaggedIds.includes(prepared.items[[...$("confirmList").children].indexOf(li)]?.id));
+  $("skipFlaggedBtn").textContent = `Leave these ${flagged.length} out`;
   $("blockBotsWrap").hidden = !(act === "leave" && bots > 0);
   $("blockBots").checked = false;
   $("blockBotsLabel").textContent = `Also block ${bots === 1 ? "this bot" : `these ${bots} bots`} (they can't message you again)`;
@@ -857,17 +950,47 @@ function bind() {
     setPref("threshold", n);
     render();
   }, 250));
-  for (const [id, key] of [["showSelect", "show"], ["kindSelect", "kind"], ["sortSelect", "sort"],
-    ["basisSelect", "basis"], ["mutedSelect", "muted"]]) {
+  for (const [id, key] of [["showSelect", "show"], ["sortSelect", "sort"], ["basisSelect", "basis"], ...EXTRA_SELECTS]) {
     $(id).addEventListener("change", (e) => {
       setPref(key, e.target.value);
+      updateFilterBadge();
       render();
     });
   }
-  $("unreadOnly").addEventListener("change", (e) => {
-    setPref("unreadOnly", e.target.checked);
+  for (const [id, key] of EXTRA_CHECKS) {
+    $(id).addEventListener("change", (e) => {
+      setPref(key, e.target.checked);
+      updateFilterBadge();
+      render();
+    });
+  }
+  $("kindChips").addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-kind]");
+    if (!b) return;
+    setPref("kind", b.dataset.kind);
+    for (const x of document.querySelectorAll("#kindChips button")) x.setAttribute("aria-pressed", String(x === b));
     render();
   });
+  $("safetyGuard").addEventListener("change", (e) => {
+    setPref("guard", e.target.checked);
+    toast(e.target.checked
+      ? "Safety guard on: bulk selection skips pinned chats, chats in your folders and chats where you're admin."
+      : "Safety guard off: bulk selection can include pinned, foldered and admin chats.", 6000);
+  });
+  $("clearFiltersBtn").addEventListener("click", () => {
+    for (const [id, key] of EXTRA_SELECTS) state.prefs[key] = DEFAULT_PREFS[key];
+    for (const [id, key] of EXTRA_CHECKS) state.prefs[key] = false;
+    savePrefs();
+    applyPrefsToControls();
+    render();
+  });
+  $("protectSelBtn").addEventListener("click", async (e) => {
+    const ids = [...state.selection];
+    if (!ids.length) return toast("Select the chats to protect first.");
+    await withBusy(e.currentTarget, () => setProtected(ids, true));
+  });
+  $("skipFlaggedBtn").addEventListener("click", () => reconfirmWithout(false));
+  $("protectFlaggedBtn").addEventListener("click", () => reconfirmWithout(true));
   $("actionSelect").addEventListener("change", (e) => {
     setPref("action", e.target.value);
     const before = state.selection.size;
@@ -881,11 +1004,18 @@ function bind() {
 
   $("selectInactiveBtn").addEventListener("click", () => {
     const p = state.prefs;
-    const ids = inactiveIds(state.visible, p.threshold, Date.now(), p.basis, p.action);
+    const ids = inactiveIds(state.visible, p.threshold, Date.now(), p.basis, p.action, p.guard);
+    const guarded = inactiveIds(state.visible, p.threshold, Date.now(), p.basis, p.action, false).length - ids.length;
     setSelected(ids, true);
-    toast(ids.length ? `Selected ${plural(ids.length, "inactive item")}.` : "No eligible inactive items in this view.");
+    toast((ids.length ? `Selected ${plural(ids.length, "inactive item")}.` : "No eligible inactive items in this view.") +
+      (guarded ? ` Safety guard skipped ${guarded} (pinned, in a folder or admin).` : ""), 6000);
   });
-  $("selectAllBtn").addEventListener("click", () => setSelected(selectableIds(state.visible, action()), true));
+  $("selectAllBtn").addEventListener("click", () => {
+    const ids = selectableIds(state.visible, action(), state.prefs.guard);
+    const guarded = selectableIds(state.visible, action(), false).length - ids.length;
+    setSelected(ids, true);
+    if (guarded) toast(`Safety guard skipped ${guarded} (pinned, in a folder or admin). Click them one by one if you mean it.`, 6000);
+  });
   $("deselectAllBtn").addEventListener("click", () => {
     state.selection.clear();
     refreshRows();

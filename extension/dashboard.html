@@ -118,6 +118,19 @@
       </section>
 
       <div class="toolbar card">
+        <div class="toolbar-row" role="group" aria-label="Type">
+          <div id="kindChips" class="segmented">
+            <button type="button" data-kind="all">All</button>
+            <button type="button" data-kind="channel">Channels</button>
+            <button type="button" data-kind="groups">Groups</button>
+            <button type="button" data-kind="supergroup">Supergroups</button>
+            <button type="button" data-kind="group">Basic groups</button>
+            <button type="button" data-kind="bot">Bots</button>
+          </div>
+          <label class="check small safety" title="Select inactive / Select all shown never pick pinned chats, chats in your Telegram folders, or chats where you're an admin. You can still click them one by one.">
+            <input type="checkbox" id="safetyGuard"> 🛡 Safety guard
+          </label>
+        </div>
         <div class="toolbar-row">
           <input id="searchInput" class="search" type="search" placeholder="Search by name or @username" aria-label="Search">
           <label class="field" title="What counts as inactive">
@@ -152,19 +165,6 @@
             </select>
           </label>
           <label class="field">
-            <span>Type</span>
-            <select id="kindSelect">
-              <option value="all">All types</option>
-              <option value="channel">Channels</option>
-              <option value="groups">All groups</option>
-              <option value="supergroup">Supergroups</option>
-              <option value="group">Basic groups</option>
-              <option value="gigagroup">Broadcast groups</option>
-              <option value="bot">Bots</option>
-              <option value="other">Other</option>
-            </select>
-          </label>
-          <label class="field">
             <span>Sort</span>
             <select id="sortSelect">
               <option value="oldest">Least recently active</option>
@@ -180,20 +180,36 @@
           <button id="selectInactiveBtn" class="btn btn-sm">Select inactive</button>
           <button id="selectAllBtn" class="btn btn-sm">Select all shown</button>
           <button id="deselectAllBtn" class="btn btn-sm">Deselect all</button>
-          <label class="field">
-            <span>Notifications</span>
-            <select id="mutedSelect">
-              <option value="any">Any</option>
-              <option value="muted">Muted</option>
-              <option value="unmuted">Not muted</option>
-            </select>
-          </label>
-          <label class="check small"><input type="checkbox" id="unreadOnly"> Has unread</label>
+          <button id="protectSelBtn" class="btn btn-sm" title="Protected chats can't be left, archived or muted until you unprotect them">🛡 Protect selected</button>
           <span class="spacer"></span>
           <span id="shownCount" class="muted small"></span>
           <button id="scanBtn" class="btn btn-sm btn-ghost" title="Read-only: look up when you last read and posted in each chat">Scan my activity</button>
           <button id="reloadBtn" class="btn btn-sm btn-ghost" title="Load the list again from Telegram">Reload list</button>
         </div>
+        <details id="moreFilters" class="more-filters">
+          <summary>More filters <span id="activeFilterCount" class="badge"></span></summary>
+          <div class="filter-grid">
+            <label class="field"><span>My role</span>
+              <select id="roleSelect"><option value="any">Any</option><option value="member">Member only</option><option value="admin">Admin / owner</option></select></label>
+            <label class="field"><span>Visibility</span>
+              <select id="visibilitySelect"><option value="any">Any</option><option value="public">Public (@username)</option><option value="private">Private</option></select></label>
+            <label class="field"><span>Pinned</span>
+              <select id="pinnedSelect"><option value="any">Any</option><option value="yes">Pinned</option><option value="no">Not pinned</option></select></label>
+            <label class="field"><span>In my folders</span>
+              <select id="folderSelect"><option value="any">Any</option><option value="yes">In a folder</option><option value="no">Not in a folder</option></select></label>
+            <label class="field"><span>Members</span>
+              <select id="sizeSelect"><option value="any">Any</option><option value="lt100">Under 100</option><option value="100-1k">100–999</option><option value="1k-10k">1,000–9,999</option><option value="10k+">10,000+</option></select></label>
+            <label class="field"><span>My messages</span>
+              <select id="postedSelect"><option value="any">Any</option><option value="yes">I've posted there</option><option value="never">I never posted (scan)</option></select></label>
+            <label class="field"><span>Notifications</span>
+              <select id="mutedSelect"><option value="any">Any</option><option value="muted">Muted</option><option value="unmuted">Not muted</option></select></label>
+            <label class="field"><span>Protected</span>
+              <select id="protectionSelect"><option value="any">Show</option><option value="hide">Hide protected</option><option value="only">Only protected</option></select></label>
+            <label class="check small"><input type="checkbox" id="unreadOnly"> Has unread</label>
+            <label class="check small"><input type="checkbox" id="mentionsOnly"> Mentions me</label>
+            <button id="clearFiltersBtn" class="btn btn-sm btn-ghost" type="button">Clear filters</button>
+          </div>
+        </details>
       </div>
 
       <div class="list card" role="region" aria-label="Groups and channels">
@@ -229,6 +245,14 @@
     <form method="dialog" class="dialog-body">
       <h2 id="confirmTitle">Leave?</h2>
       <p class="muted" id="confirmIntro"></p>
+      <div id="confirmFlaggedWrap" class="flagged" hidden>
+        <h3>⚠ <span id="confirmFlaggedTitle">These look important</span></h3>
+        <ul id="confirmFlagged" class="confirm-list"></ul>
+        <div class="row">
+          <button type="button" id="skipFlaggedBtn" class="btn btn-sm btn-primary">Leave these out</button>
+          <button type="button" id="protectFlaggedBtn" class="btn btn-sm">🛡 Protect them and leave them out</button>
+        </div>
+      </div>
       <ol id="confirmList" class="confirm-list"></ol>
       <div id="confirmRejectedWrap" hidden>
         <h3>Will be skipped</h3>

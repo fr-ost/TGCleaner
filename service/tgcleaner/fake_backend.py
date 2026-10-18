@@ -62,6 +62,9 @@ def demo_items(count: int = 320, seed: int = 7, now: datetime | None = None, bot
         if last_is_mine:
             real_mine = last
         muted = rnd.random() < (0.55 if ignored else 0.1)
+        pinned = rnd.random() < 0.04
+        folders = [rnd.choice(["Work", "Family", "Friends", "Study"])] if rnd.random() < 0.08 else []
+        mentions = rnd.choice([0, 0, 0, 0, 0, 0, 1, 3]) if unread else 0
 
         if is_bot:
             title = f"{_BOTS[(i - count) % len(_BOTS)]}{'' if i - count < len(_BOTS) else i - count} Bot"
@@ -78,6 +81,7 @@ def demo_items(count: int = 320, seed: int = 7, now: datetime | None = None, bot
             leavable=reason is None, reason=reason, muted=muted, accessible=accessible, can_post=can_post,
             last_read_at=last if unread == 0 else None,
             my_last_message_at=last if last_is_mine else None,
+            pinned=pinned, folders=folders, unread_mentions=mentions,
         ))
         truth[item_id] = (real_read, real_mine)
     return items, truth
@@ -111,6 +115,7 @@ class FakeBackend:
         self._random_failures = random_failures
         self._count = 0
         self.calls: list[tuple[str, str]] = []  # (action, item id), including scans
+        self._protected: set[str] = set()
         self.blocked: list[str] = []
 
     @property
@@ -182,6 +187,7 @@ class FakeBackend:
                 setattr(item, key, value)
             if item.id in self._gone:
                 item.leavable, item.reason, item.can_post = False, "You already left this group.", False
+            item.protected = item.id in self._protected
             items.append(item)
         self._entries = {it.id: it for it in items}
         return DialogList(items=items, excluded={"private_chat": 41, "saved_messages": 1},
@@ -189,6 +195,15 @@ class FakeBackend:
 
     def cached_item(self, item_id: str) -> DialogItem | None:
         return self._entries.get(item_id)
+
+    def set_protected(self, ids: list[str], value: bool) -> list[str]:
+        found = []
+        for item_id in ids:
+            (self._protected.add if value else self._protected.discard)(item_id)
+            if item_id in self._entries:
+                self._entries[item_id].protected = value
+                found.append(item_id)
+        return found
 
     def _remember(self, item_id: str, **values) -> None:
         self._state.setdefault(item_id, {}).update(values)

@@ -142,6 +142,7 @@ class FakeClient:
         self.connected = False
         self.dialog_requests = []  # getDialogs calls, kept apart from the action requests under test
         self.page_flood = []       # exceptions to raise on the next getDialogs calls
+        self.folders = []          # your Telegram chat folders (dialog filters)
         self._phone_code_hash = {}
         self.sign_in_calls = []
         self.sign_in_raises = []
@@ -165,6 +166,8 @@ class FakeClient:
     async def __call__(self, request):
         if isinstance(request, functions.messages.GetDialogsRequest):
             return self._dialogs_page(request)
+        if isinstance(request, functions.messages.GetDialogFiltersRequest):
+            return types.messages.DialogFilters(filters=self.folders)
         self.requests.append(request)
         if type(request) in self.fail_on:
             raise self.fail_on[type(request)]
@@ -222,12 +225,13 @@ def _peer(entity):
     return types.PeerUser(entity.id)
 
 
-def dialog(entity, date=NOW, unread=7, read_max=500, out=False, mute_until=None, folder=0, with_entity=True):
+def dialog(entity, date=NOW, unread=7, read_max=500, out=False, mute_until=None, folder=0, with_entity=True,
+           pinned=False, mentions=0):
     """One row of a getDialogs answer: raw Dialog + entity + its top message."""
     peer = _peer(entity)
     message = types.Message(id=next(_msg_ids), peer_id=peer, date=date, message="hi", out=out) if date else None
     raw = types.Dialog(peer=peer, top_message=message.id if message else 0, read_inbox_max_id=read_max,
-                       read_outbox_max_id=0, unread_count=unread, unread_mentions_count=0,
+                       read_outbox_max_id=0, unread_count=unread, unread_mentions_count=mentions, pinned=pinned,
                        unread_reactions_count=0, unread_poll_votes_count=0,
                        notify_settings=types.PeerNotifySettings(mute_until=mute_until),
                        folder_id=folder or None)
@@ -338,6 +342,52 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
                 await self.backend.load_dialogs()
         self.assertEqual(ctx.exception.code, "load_failed")
         self.assertIn("RuntimeError: boom", ctx.exception.message)
+
+    async def test_importance_signals_and_protection(self):
+        self.client.dialogs[0] = dialog(channel(111, broadcast=True), pinned=True, mentions=2)
+        self.client.folders = [
+            types.DialogFilter(id=2, title=types.TextWithEntities(text="Work", entities=[]), pinned_peers=[],
+                               include_peers=[types.InputPeerChat(222), types.InputPeerChannel(111, 999)], exclude_peers=[]),
+            types.DialogFilterDefault(),
+        ]
+        result = await self.backend.load_dialogs()
+        by_id = {it.id: it for it in result.items}
+        self.assertTrue(by_id[CH].pinned)
+        self.assertEqual(by_id[CH].unread_mentions, 2)
+        self.assertEqual(by_id[CH].folders, ["Work"])
+        self.assertEqual(by_id[GR].folders, ["Work"])
+        self.assertEqual(by_id[BOT_ID].folders, [])
+
+        self.assertEqual(self.backend.set_protected([CH, "-1009999"], True), [CH])
+        for action in (LEAVE, ARCHIVE, MUTE):
+            with self.assertRaises(ActionFailed) as ctx:
+                await self.backend.perform(action, CH, {})
+            self.assertIn("Protected", ctx.exception.message)
+        self.assertEqual(self.client.requests, [])
+        # Saved: still protected after a reload and for a new backend on the same data folder.
+        self.assertTrue(json.loads((self.dir / "protected.json").read_text()))
+        await self.backend.load_dialogs()
+        self.assertTrue(self.backend.cached_item(CH).protected)
+        fresh = TelethonBackend(self.cfg, self.dir, client_factory=lambda: self.client)
+        await fresh.start()
+        await fresh.load_dialogs()
+        self.assertTrue(fresh.cached_item(CH).protected)
+        fresh.set_protected([CH], False)
+        self.assertEqual((await fresh.perform(LEAVE, CH, {}))[0], "left")
+
+    async def test_folders_failure_never_blocks_the_list(self):
+        original = self.client.__class__.__call__
+
+        async def no_folders(request):
+            if isinstance(request, functions.messages.GetDialogFiltersRequest):
+                raise errors.RPCError(request=None, message="WHATEVER", code=400)
+            return await original(self.client, request)
+
+        self.client.__call__ = no_folders
+        self.backend._client = type("C", (), {"__call__": staticmethod(no_folders),
+                                              "__getattr__": lambda _, n: getattr(self.client, n)})()
+        result = await self.backend.load_dialogs()
+        self.assertEqual(len(result.items), 4)
 
     async def test_load_requires_login(self):
         self.client.authorized = False

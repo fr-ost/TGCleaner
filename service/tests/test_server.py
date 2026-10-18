@@ -386,6 +386,73 @@ class CleanupActionTests(ApiTestCase):
         self.assertEqual(job["state"], "cancelled")
 
 
+class WebDashboardTests(ApiTestCase):
+    """The service also serves the dashboard at "/" (Railway: open the link, no extension needed)."""
+
+    async def test_serves_dashboard_files_with_strict_headers(self):
+        for path, ctype in (("/", "text/html"), ("/dashboard.js", "text/javascript"), ("/logic.js", "text/javascript"),
+                            ("/dashboard.css", "text/css"), ("/icons/icon48.png", "image/png")):
+            async with self.http.get(self.base + path) as r:
+                self.assertEqual(r.status, 200, path)
+                self.assertEqual(r.content_type, ctype, path)
+                self.assertIn("script-src 'self'", r.headers["Content-Security-Policy"])
+                self.assertIn("frame-ancestors 'none'", r.headers["Content-Security-Policy"])
+        for path in ("/manifest.json", "/background.js", "/../service/tgcleaner/config.py", "/icons/", "/api"):
+            async with self.http.get(self.base + path) as r:
+                self.assertIn(r.status, (403, 404, 405), path)  # never served
+
+    async def test_same_origin_page_can_use_the_api(self):
+        own = f"http://127.0.0.1:{self.port}"
+        status, _, _ = await self.get("/api/status", headers={"Origin": own, "X-TGCleaner": "1"})
+        self.assertEqual(status, 200)
+        # same-origin GETs carry no Origin, only Sec-Fetch-Site
+        status, _, _ = await self.get("/api/dialogs", headers={"Sec-Fetch-Site": "same-origin", "X-TGCleaner": "1"})
+        self.assertEqual(status, 200)
+
+    async def test_other_sites_still_blocked(self):
+        for headers in ({"Origin": "https://evil.example", "X-TGCleaner": "1"},
+                        {"Sec-Fetch-Site": "cross-site", "X-TGCleaner": "1"},
+                        {"Origin": f"http://127.0.0.1:{self.port + 1}", "X-TGCleaner": "1"}):
+            status, body, _ = await self.get("/api/status", headers=headers)
+            self.assertEqual(status, 403, headers)
+
+
+class ProtectTests(ApiTestCase):
+    async def test_protected_chats_are_refused_by_every_action(self):
+        _, body, _ = await self.get("/api/dialogs")
+        ids = [it["id"] for it in body["items"] if it["leavable"] and not it["muted"] and not it["archived"]][:3]
+        status, res, _ = await self.post("/api/protect", {"ids": ids[:2], "protected": True})
+        self.assertEqual((status, res["ids"]), (200, ids[:2]))
+        for action in ("leave", "archive", "mute"):
+            _, prep, _ = await self.post("/api/actions/prepare", {"action": action, "ids": ids})
+            self.assertEqual([it["id"] for it in prep["items"]], ids[2:], action)
+            self.assertTrue(all("Protected" in r["reason"] for r in prep["rejected"]))
+        _, body, _ = await self.get("/api/dialogs")
+        self.assertEqual({it["id"] for it in body["items"] if it["protected"]}, set(ids[:2]))
+        await self.post("/api/protect", {"ids": ids[:1], "protected": False})
+        _, prep, _ = await self.post("/api/actions/prepare", {"action": "leave", "ids": ids})
+        self.assertEqual([it["id"] for it in prep["items"]], [ids[0], ids[2]])
+        self.assertEqual(self.backend.calls, [])
+
+    async def test_protecting_mid_job_stops_that_item(self):
+        _, body, _ = await self.get("/api/dialogs")
+        ids = [it["id"] for it in body["items"] if it["leavable"]][:30]
+        self.cfg.leave_delay_seconds = 0.05
+        _, prep, _ = await self.post("/api/actions/prepare", {"action": "leave", "ids": ids})
+        await self.post("/api/actions/start", {"token": prep["token"]})
+        await self.post("/api/protect", {"ids": [ids[-1]], "protected": True})
+        job = await self.wait_job()
+        last = next(it for it in job["items"] if it["id"] == ids[-1])
+        self.assertEqual(last["status"], "failed")
+        self.assertIn("Protected", last["message"])
+
+    async def test_validation(self):
+        await self.get("/api/dialogs")
+        for body in ({"ids": ["-1"]}, {"ids": ["-1"], "protected": "yes"}, {"ids": [], "protected": True}):
+            status, _, _ = await self.post("/api/protect", body)
+            self.assertEqual(status, 400, body)
+
+
 TOKEN = "t" * 40
 
 

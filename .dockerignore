@@ -4,7 +4,6 @@
 **/*.pyc
 **/*.session
 **/*.session-journal
-extension
 docs
 tests
 service/tests

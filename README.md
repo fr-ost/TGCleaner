@@ -8,7 +8,8 @@ A personal-use, all-in-one cleanup tool for your Telegram chat list. It finds de
   - *No new messages in the chat*: dead groups and channels, and bots you haven't used.
   - *You haven't read or posted*: chats that may be very active but that you never open.
 - **Actions**: **Leave / remove** (leave groups and channels, delete bot chats, optionally block the bots), **Archive**, or **Mute** forever.
-- Search, filters (type, muted, has unread), sorting, Select inactive, Select all shown, Deselect all, Shift+click ranges.
+- **Never leave something important by mistake**: 🛡 **protect** any chat (the service then refuses every action on it, saved across restarts); the **safety guard** (on by default) keeps pinned chats, chats in your Telegram folders and chats where you're admin out of bulk selection; and the confirmation flags chats that **look important** (pinned, in a folder, admin, you posted in the last 30 days, you read it this week, unread mentions) with one click to leave them out or protect them.
+- Search, type buttons (Channels / Groups / Supergroups / Basic groups / Bots), more filters (my role, public/private, pinned, in my folders, member count, I've posted / never posted, notifications, has unread, mentions me, protected), sorting, Select inactive, Select all shown, Deselect all, Shift+click ranges.
 - Every action shows the exact names first, asks once, then runs one item at a time. You see Telegram's real answer for every item, and can retry the ones that can be retried.
 - Runs entirely on your computer. There is no cloud backend, no account, and no analytics.
 - Private chats with people and **Saved Messages are never listed or touched.**
@@ -108,7 +109,7 @@ Demo mode uses 320 fake groups and channels plus 24 bots, and never contacts Tel
 
 ## Deploy on Railway (optional)
 
-You can run the service on [Railway](https://railway.com) instead of your computer, so the dashboard works without keeping a terminal open.
+You can run the service on [Railway](https://railway.com) instead of your computer. **The dashboard is then simply your Railway link**: open it in any browser (phone included); no extension and no terminal needed. (The Chrome extension still works with a Railway deployment too, via **Connection**.)
 
 > **Read this first.** On Railway, your logged-in Telegram session lives on a server on the internet. Without an access token, **anyone who finds the URL can use your Telegram account** through it while it runs. Setting `TGC_ACCESS_TOKEN` is optional but recommended. Either way, click **Disconnect** and delete the project when you're done.
 
@@ -124,7 +125,8 @@ You can run the service on [Railway](https://railway.com) instead of your comput
 
    Optional: `TGC_DEMO=1` runs fake data with no Telegram (good for a first test); `TGC_LEAVE_DELAY` / `TGC_SCAN_DELAY` change the pauses; `TGC_EXTENSION_IDS` if you changed the extension's key.
 4. **Expose it**: *Settings → Networking → Generate Domain*. You get `https://<something>.up.railway.app`.
-5. **Connect the extension**: open the dashboard, click **Connection** (top right), enter the `https://…up.railway.app` address (and the access token, if you set one), then **Save & connect**. Log in to Telegram as usual.
+5. **Open the link** (`https://<something>.up.railway.app`) in your browser and log in to Telegram. If you set `TGC_ACCESS_TOKEN`, the page asks for it first (it's kept in that browser only).
+   *Using the extension instead?* Click **Connection**, enter the address (and token, if set), then **Save & connect**.
 
 Notes:
 * Keep **one replica**: the running job and login steps live in the service's memory.
@@ -145,7 +147,14 @@ Notes:
 * **Scan my activity** (needed for the second basis): the chat list already tells when you last read every chat you're caught up on, and whether the newest message is yours. For the rest, the scan asks Telegram, about 1–2 small read-only requests per chat at roughly one chat per second. It changes nothing. Results are kept in `~/.tgcleaner/scan_cache.json`, and each chat's result is dropped automatically once you read further in that chat.
 * **Unknown activity**: when Telegram returned no messages (history cleared or hidden) or a chat isn't scanned yet. Such items are counted separately and **never** selected by *Select inactive*. Missing data is not treated as proof of inactivity.
 * **The "You" column** shows when you last read (`read 5 months ago`) and posted (`posted 2 years ago`, `never posted`); `not scanned yet` means a scan would fill it in. Channels you can't post in show only reading.
-* **Filters**: Show (All / Inactive / Active / Unknown activity / Can't *action*), Type (channels, all groups, supergroups, basic groups, broadcast groups, **bots**), Notifications (muted / not muted), Has unread. **Sort**: least or most recently active (unknown always last), name, type, most unread.
+* **Type buttons**: All · Channels · Groups (all kinds) · Supergroups (incl. broadcast groups) · Basic groups · Bots.
+* **Filters**: Show (All / Inactive / Active / Unknown activity / Can't *action*); under **More filters**: my role (member only / admin or owner), visibility (public @username / private), pinned, in my folders, members (under 100 … 10,000+), my messages (I've posted / I never posted, needs the scan), notifications (muted / not muted), protected (show / hide / only), has unread, mentions me. **Clear filters** resets them. **Sort**: least or most recently active (unknown always last), name, type, most unread.
+
+### Protecting what matters
+* **🛡 on each row** protects or unprotects a chat; **🛡 Protect selected** protects everything you've selected. Protected chats get a green edge and can't be left, archived or muted until you unprotect them. The service enforces this, even for a job that's already running. The list is saved in `protected.json` next to the session.
+* **Safety guard** (top right, on by default): *Select inactive* and *Select all shown* skip pinned chats, chats you added to one of your Telegram folders, and chats where you're an admin or owner. You can still click those one by one if you really mean it.
+* **Looks important** check: before anything runs, the confirmation lists chats that are pinned, in a folder, where you're admin, where you posted in the last 30 days or read this week, or that have unread mentions, each with its reason. **Leave these out** removes them from the batch; **Protect them and leave them out** also protects them for next time.
+* Folder detection uses the chats you explicitly added to your Telegram folders (rule-based folder contents such as "all groups" aren't counted).
 
 ### Acting on it
 * Pick the **Action** in the bottom bar:
@@ -271,11 +280,12 @@ service/
     config.py         private data dir + config validation
     telegram_backend.py  Telethon: login, dialogs, classification, actions, scan
     jobs.py           sequential batch jobs (actions + scan) with flood-wait handling
+    protect.py        your protected chats (saved list)
     server.py         aiohttp API + security checks
     fake_backend.py   demo mode / tests (no Telegram)
   tests/
 start.sh / start.bat  create venv, install, set up, run (local)
-Dockerfile, railway.json  hosted deployment (cloud mode)
+Dockerfile, railway.json  hosted deployment (cloud mode; serves the dashboard at "/")
 tests/extension/      JS unit tests
 ```
 
