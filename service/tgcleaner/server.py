@@ -15,9 +15,10 @@ Security model (local, the default):
   * Request bodies are never logged (they may contain login codes or passwords).
 
 Cloud mode (serve --cloud, e.g. on Railway) is reachable from the internet, where
-Origin can be forged by any non-browser client. There, every /api request must also
-carry "Authorization: Bearer <TGC_ACCESS_TOKEN>" (constant-time compared; repeated
-failures lock the API for a minute), and the Host check is replaced by that token.
+Origin can be forged by any non-browser client, and the Host check is dropped. If
+TGC_ACCESS_TOKEN is set, every /api request must carry "Authorization: Bearer <token>"
+(constant-time compared; repeated failures lock the API for a minute). Without it,
+anyone who knows the URL can use the service.
 """
 
 from __future__ import annotations
@@ -88,7 +89,7 @@ AUTH_FAILURE_LIMIT = 20     # wrong tokens allowed per window ...
 AUTH_FAILURE_WINDOW = 60.0  # ... seconds, before the API locks for a window
 
 
-def make_security_middleware(cfg: Config, access_token: str | None = None):
+def make_security_middleware(cfg: Config, access_token: str | None = None, cloud: bool = False):
     allowed_hosts = {f"127.0.0.1:{cfg.port}", f"localhost:{cfg.port}"}
     allowed_origins = cfg.allowed_origins
     expected = f"Bearer {access_token}".encode() if access_token else None
@@ -101,7 +102,7 @@ def make_security_middleware(cfg: Config, access_token: str | None = None):
 
     @web.middleware
     async def security(request: web.Request, handler):
-        if expected is None and request.host not in allowed_hosts:
+        if not cloud and request.host not in allowed_hosts:
             return _error(403, "bad_host", "Requests must address 127.0.0.1 directly.")
         if request.path == "/health":
             # Lets the start script / you check the service is up. Reveals nothing.
@@ -388,8 +389,9 @@ async def job_cancel(request):
 
 
 def create_app(cfg: Config, backend: Backend, *, demo: bool = False,
-               access_token: str | None = None) -> web.Application:
-    app = web.Application(middlewares=[make_security_middleware(cfg, access_token)], client_max_size=MAX_BODY)
+               access_token: str | None = None, cloud: bool = False) -> web.Application:
+    middleware = make_security_middleware(cfg, access_token, cloud=cloud or access_token is not None)
+    app = web.Application(middlewares=[middleware], client_max_size=MAX_BODY)
     app[BACKEND] = backend
     app[STATE] = State(cfg, demo)
     app.router.add_get("/health", lambda r: web.json_response({"ok": True}))
@@ -424,10 +426,14 @@ def create_app(cfg: Config, backend: Backend, *, demo: bool = False,
     return app
 
 
-def run(cfg: Config, backend: Backend, *, demo: bool = False, access_token: str | None = None) -> None:
-    app = create_app(cfg, backend, demo=demo, access_token=access_token)
+def run(cfg: Config, backend: Backend, *, demo: bool = False, access_token: str | None = None,
+        cloud: bool = False) -> None:
+    app = create_app(cfg, backend, demo=demo, access_token=access_token, cloud=cloud)
     demo_note = "  [DEMO MODE: no Telegram connection]" if demo else ""
-    if access_token:
+    if cloud:
+        if not access_token:
+            print("WARNING: TGC_ACCESS_TOKEN is not set. Anyone who knows this service's URL can use your "
+                  "logged-in Telegram session. Delete the deployment when you're done.", flush=True)
         # Cloud mode: reachable from outside (behind the platform's HTTPS proxy), token required.
         print(f"TG Cleaner service (cloud mode) listening on 0.0.0.0:{cfg.port}{demo_note}", flush=True)
         web.run_app(app, host="0.0.0.0", port=cfg.port, access_log=None, print=None)

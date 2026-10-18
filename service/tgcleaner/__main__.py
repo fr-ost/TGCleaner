@@ -104,7 +104,7 @@ def serve_cloud() -> int:
         backend = TelethonBackend(settings.config, base)
     print(f"Data directory: {base} (mount a persistent volume here, or you'll have to log in after every deploy)",
           flush=True)
-    run(settings.config, backend, demo=settings.demo, access_token=settings.access_token)
+    run(settings.config, backend, demo=settings.demo, access_token=settings.access_token, cloud=True)
     return 0
 
 

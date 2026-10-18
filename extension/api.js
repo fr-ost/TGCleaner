@@ -49,7 +49,6 @@ export async function loadSettings() {
 export async function saveSettings(serviceUrl, token) {
   const url = normalizeServiceUrl(serviceUrl);
   const cleaned = String(token ?? "").trim();
-  if (!isLocal(url) && !cleaned) throw new Error("A hosted service needs its access token (TGC_ACCESS_TOKEN).");
   baseUrl = url;
   accessToken = cleaned;
   await chrome.storage.local.set({ serviceUrl: url, accessToken: cleaned });

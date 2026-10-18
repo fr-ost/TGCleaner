@@ -30,14 +30,14 @@
       <p class="muted">The extension talks to the TG Cleaner service, which talks to Telegram. Run it on this computer, or use your hosted copy (e.g. on Railway).</p>
       <ol class="steps">
         <li><strong>On this computer:</strong> run <code>./start.sh</code> (macOS/Linux) or <code>start.bat</code> (Windows) in the project folder and keep that window open. Address: <code>http://127.0.0.1:8765</code>, no token.</li>
-        <li><strong>Hosted:</strong> enter your service's <code>https://</code> address and the <code>TGC_ACCESS_TOKEN</code> you set there.</li>
+        <li><strong>Hosted:</strong> enter your service's <code>https://</code> address, plus its <code>TGC_ACCESS_TOKEN</code> if you set one.</li>
       </ol>
       <p id="offlineDetail" class="form-error" role="alert"></p>
       <form id="connForm" class="stack">
         <label for="urlInput">Service address</label>
         <input id="urlInput" type="url" required placeholder="http://127.0.0.1:8765" autocomplete="off" spellcheck="false">
-        <label for="tokenInput">Access token <span class="muted small">(hosted service only)</span></label>
-        <input id="tokenInput" type="password" autocomplete="off" spellcheck="false" placeholder="Leave empty for this computer">
+        <label for="tokenInput">Access token <span class="muted small">(only if you set TGC_ACCESS_TOKEN)</span></label>
+        <input id="tokenInput" type="password" autocomplete="off" spellcheck="false" placeholder="Leave empty if not set">
         <button class="btn btn-primary" type="submit">Save &amp; connect</button>
       </form>
     </section>

@@ -446,6 +446,15 @@ class CloudModeTests(unittest.IsolatedAsyncioTestCase):
         status, body, _ = await self.get("/api/status", HEADERS | self.public | {"Authorization": f"Bearer {TOKEN}"})
         self.assertEqual((status, body["error"]), (429, "auth_locked"))
 
+    async def test_cloud_mode_without_token_accepts_public_host(self):
+        app = TestServer(create_app(self.cfg, self.backend, cloud=True), host="127.0.0.1", port=free_port())
+        await app.start_server()
+        try:
+            async with self.http.get(f"http://127.0.0.1:{app.port}/api/dialogs", headers=HEADERS | self.public) as r:
+                self.assertEqual(r.status, 200)
+        finally:
+            await app.close()
+
     async def test_local_mode_still_rejects_foreign_hosts(self):
         local = TestServer(create_app(self.cfg, self.backend), host="127.0.0.1", port=free_port())
         await local.start_server()
@@ -466,6 +475,12 @@ class CloudSettingsTests(unittest.TestCase):
         self.assertEqual(s.config.leave_delay_seconds, 3.0)
         self.assertEqual(s.config.extension_ids, [DEFAULT_EXTENSION_ID])
 
+    def test_token_is_optional(self):
+        from tgcleaner.config import cloud_settings_from_env
+
+        s = cloud_settings_from_env({"TG_API_ID": "12345", "TG_API_HASH": "a" * 32})
+        self.assertIsNone(s.access_token)
+
     def test_demo_needs_no_telegram_credentials(self):
         from tgcleaner.config import cloud_settings_from_env
 
@@ -475,7 +490,7 @@ class CloudSettingsTests(unittest.TestCase):
     def test_rejects_missing_or_weak_settings(self):
         from tgcleaner.config import cloud_settings_from_env
 
-        for env in ({}, {"TGC_ACCESS_TOKEN": "short", "TG_API_ID": "1", "TG_API_HASH": "a" * 32},
+        for env in ({"TGC_ACCESS_TOKEN": "short", "TG_API_ID": "1", "TG_API_HASH": "a" * 32},
                     {"TGC_ACCESS_TOKEN": TOKEN}, {"TGC_ACCESS_TOKEN": TOKEN, "TG_API_ID": "1", "TG_API_HASH": "nothex"},
                     {"TGC_ACCESS_TOKEN": TOKEN, "TG_API_ID": "1", "TG_API_HASH": "a" * 32, "TGC_EXTENSION_IDS": "bad"}):
             with self.assertRaises(ValueError, msg=env):

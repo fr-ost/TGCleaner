@@ -110,7 +110,7 @@ Demo mode uses 320 fake groups and channels plus 24 bots, and never contacts Tel
 
 You can run the service on [Railway](https://railway.com) instead of your computer, so the dashboard works without keeping a terminal open.
 
-> **Read this first.** On Railway, your logged-in Telegram session lives on a server on the internet. Anyone with that session file, or your access token, can control your Telegram account. The deployment is protected by a long secret **access token** on every request (plus HTTPS and the extension-origin check). Keep the token private, use a long random one, and click **Disconnect** (or delete the volume) when you no longer need the deployment.
+> **Read this first.** On Railway, your logged-in Telegram session lives on a server on the internet. Without an access token, **anyone who finds the URL can use your Telegram account** through it while it runs. Setting `TGC_ACCESS_TOKEN` is optional but recommended. Either way, click **Disconnect** and delete the project when you're done.
 
 1. **Create the service**: in Railway, *New Project → Deploy from GitHub repo* → pick this repository. Railway finds the `Dockerfile` and `railway.json` (health check on `/health`, one replica).
 2. **Add a volume**: in the service, open *Settings → Volumes* (or right-click → *Attach volume*) and set the **mount path to `/data`**. Without it you'd have to log in again after every deploy.
@@ -120,11 +120,11 @@ You can run the service on [Railway](https://railway.com) instead of your comput
    |---|---|
    | `TG_API_ID` | your API ID from my.telegram.org |
    | `TG_API_HASH` | your API hash |
-   | `TGC_ACCESS_TOKEN` | a long random secret. Generate one with `python3 -c "import secrets; print(secrets.token_urlsafe(32))"` |
+   | `TGC_ACCESS_TOKEN` | *optional*: a long random secret (24+ characters), e.g. from `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`. If set, enter the same value in the extension. |
 
-   Optional: `TGC_DEMO=1` runs fake data with no Telegram (good for a first test; still needs `TGC_ACCESS_TOKEN`); `TGC_LEAVE_DELAY` / `TGC_SCAN_DELAY` change the pauses; `TGC_EXTENSION_IDS` if you changed the extension's key.
+   Optional: `TGC_DEMO=1` runs fake data with no Telegram (good for a first test); `TGC_LEAVE_DELAY` / `TGC_SCAN_DELAY` change the pauses; `TGC_EXTENSION_IDS` if you changed the extension's key.
 4. **Expose it**: *Settings → Networking → Generate Domain*. You get `https://<something>.up.railway.app`.
-5. **Connect the extension**: open the dashboard, click **Connection** (top right), enter the `https://…up.railway.app` address and your access token, then **Save & connect**. Log in to Telegram as usual.
+5. **Connect the extension**: open the dashboard, click **Connection** (top right), enter the `https://…up.railway.app` address (and the access token, if you set one), then **Save & connect**. Log in to Telegram as usual.
 
 Notes:
 * Keep **one replica**: the running job and login steps live in the service's memory.
@@ -185,7 +185,7 @@ Click **Disconnect** in the header. This calls Telegram's logout (ending the ses
 
 ## Security
 
-These points describe the default local mode. In cloud mode (Railway), the service listens on the platform's network, the Host check is replaced by the required access token (constant-time compared, `Authorization: Bearer …`, the API locks for a minute after 20 wrong tokens), and the extension refuses plain `http://` for anything but this computer, so the token only travels over HTTPS.
+These points describe the default local mode. In cloud mode (Railway), the service listens on the platform's network and the Host check is dropped. If `TGC_ACCESS_TOKEN` is set, every request needs it (`Authorization: Bearer …`, constant-time compared, the API locks for a minute after 20 wrong tokens); if not, anyone with the URL can use the service. The extension refuses plain `http://` for anything but this computer.
 
 * The service listens on **127.0.0.1** only, never on your network.
 * Every `/api` request must:

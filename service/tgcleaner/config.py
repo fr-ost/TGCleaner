@@ -141,7 +141,7 @@ MIN_TOKEN_LENGTH = 24
 @dataclass
 class CloudSettings:
     config: Config
-    access_token: str
+    access_token: str | None
     demo: bool
 
 
@@ -149,17 +149,15 @@ def cloud_settings_from_env(env=None) -> CloudSettings:
     """Settings for a hosted deployment (e.g. Railway), read from environment variables.
 
     TG_API_ID, TG_API_HASH  your app credentials from my.telegram.org (not needed with TGC_DEMO=1)
-    TGC_ACCESS_TOKEN        required: long random secret; the extension must send it
+    TGC_ACCESS_TOKEN        optional: long random secret the extension must send (no auth when unset)
     PORT                    port to listen on (set by Railway)
     TGC_EXTENSION_IDS       optional, comma-separated extension IDs (default: the pinned one)
     TGC_DEMO=1              fake data, no Telegram (to test a deployment)
     """
     env = os.environ if env is None else env
-    token = (env.get("TGC_ACCESS_TOKEN") or "").strip()
-    if len(token) < MIN_TOKEN_LENGTH:
-        raise ValueError(
-            f"TGC_ACCESS_TOKEN must be set to a random secret of at least {MIN_TOKEN_LENGTH} characters. "
-            "Generate one with: python3 -c \"import secrets; print(secrets.token_urlsafe(32))\"")
+    token = (env.get("TGC_ACCESS_TOKEN") or "").strip() or None
+    if token is not None and len(token) < MIN_TOKEN_LENGTH:
+        raise ValueError(f"TGC_ACCESS_TOKEN is optional, but if set it must be at least {MIN_TOKEN_LENGTH} characters.")
     demo = env.get("TGC_DEMO", "").strip().lower() in ("1", "true", "yes")
     ext_ids = [x for x in (env.get("TGC_EXTENSION_IDS") or "").replace(" ", "").split(",") if x] or [DEFAULT_EXTENSION_ID]
     port = int(env.get("PORT") or 8080)
